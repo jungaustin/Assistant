@@ -3,3 +3,5 @@
 /__pycache__
 /pyaudio_portaudio
 /.vscode
+realtimesst.log
+req.txt
