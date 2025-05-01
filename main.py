@@ -1,9 +1,9 @@
-# Next change llm interactions to be an agent. I have a chatgpt page open called downlaod to venv only already asked
+# Change to LangGraph Agent, and also create a tool that plays a playlist I own
+# currently only working when something is already be ing played so handle pause/start playback
 # on the test2 file, make it so it runs without the server being on using the refresh token
 
 #Credit Sylvester Seo For helping
 
-# Next to do, memory and summary are not working for some reason. I think i have to have the chain work with the memory as well invoking memory. do that next. Can also try to decrease delay but not mandatory its good enough. Next I will also have the assistant be able to play music
 
 from llm import LLMInteractions
 from tts import TextToSpeech
