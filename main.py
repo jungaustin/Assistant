@@ -25,8 +25,8 @@ class Assistant:
     def run(self):
         while True:
             user_input = self.speech_to_text.listen()
-            response_generator = self.llm_interactions.stream_chain(user_input)
-            self.text_to_speech.speak(response_generator)
+            response = self.llm_interactions.run_agent(user_input)
+            self.text_to_speech.speak(response)
 
 if __name__ == '__main__':
     assistant = Assistant()

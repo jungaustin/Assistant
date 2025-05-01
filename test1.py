@@ -22,7 +22,7 @@ agent = initialize_agent(llm = llm,
                                     NewJeans
                                     Yorushika
                                     Ai Tomioka
-                                    Reona
+                                    ReoNa
                                     Riria
                                  Query construction rules:
                                     Include all provided fields in the query.
@@ -32,7 +32,7 @@ agent = initialize_agent(llm = llm,
                                     Input: "Play Ferris Wheel by QWER" → Query: track:Ferris Wheel artist:QWER
                                     Input: "Play Ferris Wheel from the album Summer Nights" → Query: track:Ferris Wheel album:Summer Nights
                                     Input: "Play Ferris Wheel by QWER from the album Summer Nights" → Query: track:Ferris Wheel artist:QWER album:Summer Nights
-                                    Input: "Play any song by Yorushika" → Query: artist:Yorushika
+                                    Input: "Play any song by Reona" → Query: artist:ReoNa
                                     Input: "Play track with ISRC code USUM71703861" → Query: isrc:USUM71703861
                                 """
                              )
