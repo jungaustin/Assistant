@@ -16,6 +16,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 
 
 class LLMInteractions:
+    #
     def __init__(self):
         self.llm = llm = ChatOpenAI(
             model_name="gpt-4o",
@@ -56,18 +57,17 @@ class LLMInteractions:
             ),
             ("human", "{input}")
         ])
-        self.tools_manager = ToolManager()
-        self.agent = initialize_agent(
-            tools = self.tools_manager.get_tools(),
-            llm = self.llm,
-            agent=AgentType.OPENAI_FUNCTIONS,
-            memory = self.memory,
-            verbose=True,
-        )
+
+    
+    #
+    def ask_llm(self, message):
+        response = self.llm(self.prompt.format(input=message))
+        yield response
+        self.memory.save_context({"input" : message}, {"output": response})
+        self.summarize_conversation()
         
-    # Define the summary check logic
+    # 
     def summarize_conversation(self):
-        """Summarize the conversation if needed"""
         conversation_history = self.memory.load_memory_variables({})["history"]
         if len(conversation_history) > 6:
             summary_message = "Summarize the conversation so far:"
@@ -78,30 +78,3 @@ class LLMInteractions:
         print(self.memory.load_memory_variables({})["history"])
         return None
     
-    def run_agent(self, message):
-        response = self.agent.run(message)
-        yield response
-        self.memory.save_context({"input" : message}, {"output": response})
-        self.summarize_conversation
-    
-    
-    
-    # Ask the LLM and return the response
-    # def ask_llm(self, input):
-    #     return self.agent.run(input)
-    # Old Streaming to Get the TTS Faster before I swapped to using an Agent
-    # def stream_chain(self, message):
-    #     output_chunks = []
-    #     for chunk in self.chain.stream({"input": message}):
-    #         content = getattr(chunk, 'content', None)
-    #         if content:
-    #             output_chunks.append(content)
-    #             print()
-    #             print("yield: " + content)
-    #             print()
-    #             yield content
-        
-    #     full_output = "".join(output_chunks)
-        
-    #     self.memory.save_context({"input": message}, {"output": full_output})
-    #     self.summarize_conversation()

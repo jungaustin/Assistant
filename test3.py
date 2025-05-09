@@ -5,12 +5,14 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import START, StateGraph, MessagesState
 from langgraph.prebuilt import tools_condition, ToolNode
-import test2
-
+from tools.spotify_tools import SpotifyTools
+from spotify_client import SpotifyClient
 from dotenv import load_dotenv
 import os
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
+spotcli = SpotifyClient()
+toolset = SpotifyTools(spotcli)
 
 def play_song(query : str) -> str:
     """
@@ -37,11 +39,11 @@ def play_song(query : str) -> str:
     Args:
        query (string): the search query the spotify api will use to play a song
 """
-    return test2.play_song(query)
+    return toolset.create_play_song_tool(query)
 
 
 
-tools = [play_song]
+tools = [toolset.create_play_song_tool()]
 
 llm = ChatOpenAI(model="gpt-4o")
 llm_with_tools = llm.bind_tools(tools)
