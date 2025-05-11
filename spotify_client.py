@@ -52,13 +52,16 @@ class SpotifyClient:
                 self.device_id = device['id']
                 break
 
-    def play_song(self, query : str):
+    def play_song(self, query : str) -> str:
         if not self.is_token_valid():
             self.refresh_token()
         
         if self.device_id is None:
             self.get_device_id()
         
+        print()
+        print("query: " + query)
+        print()
         search = requests.get(
             self.API_BASE_URL + '/search',
             headers=self.get_headers(),
