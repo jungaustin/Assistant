@@ -1,4 +1,5 @@
-# create a tool that plays a playlist I own and play/pause feature
+# Try again to use the better open wake word model cause its kinda bad
+# Create play/pause feature
 
 # Currently two things that are wrong. Firstly, If the app is not open already, it opens it but it takes awhile so It gets a status error cause the app isnt open so it cant play. Secondly, The Text to Speech Highlights ALL of the thoughts of the agent, instead of just the final thought, so It repeats what I ask it to.
 # Maybe make the opening of the app a different tool, so I can say "and" and have it do both. 
@@ -31,6 +32,7 @@ class Assistant:
     
     def run(self):
         while True:
+            print('listening')
             user_input = self.speech_to_text.listen()
             response = self.agent.run(user_input)
             self.text_to_speech.speak(response)

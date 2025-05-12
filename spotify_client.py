@@ -55,6 +55,7 @@ class SpotifyClient:
                 break
 
     def play_song(self, query : str) -> str:
+        print(query)
         if not self.is_token_valid():
             self.refresh_token()
         
@@ -86,7 +87,7 @@ class SpotifyClient:
                                 json = data
                                 )
         if response.status_code == 204:
-            return "Successfully started playing the requested song"
+            return "Playing."
         else:
             return f"Failed to play song. Status code: {response.status_code}"
     
@@ -139,7 +140,15 @@ class SpotifyClient:
 
         if(self.playlists == None):
             _ = self.get_my_playlists()
-        playlist_name = self.get_best_playlist_match(input)
+        
+        for name in self.playlists.keys():
+            if input.strip().lower() == name.strip().lower():
+                playlist_name = name
+                break
+
+        if playlist_name is None:
+            playlist_name = self.get_best_playlist_match(input)
+
         if playlist_name is None:
             return f"No matching playlist found for '{input}'."
         
@@ -154,14 +163,12 @@ class SpotifyClient:
             json=data
         )
         if response.status_code == 204:
-            return f"Playlist '{playlist_name}' is now playing."
+            return f"Playing '{playlist_name}'."
         else:
             print(response)
             return f"Failed to play playlist. Status code: {response.status_code}"
     
     def shuffle(self, state : bool) -> str:
-        print(state)
-        print(type(state))
         if not self.is_token_valid():
             self.refresh_token()
         

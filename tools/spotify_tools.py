@@ -19,7 +19,7 @@ class SpotifyTools:
                 Ai Tomioka
                 LiSA
                 ReoNa
-                Riria
+                Riria. (this period is necessary)
                 Query construction rules:
                 Include all provided fields in the query.
                 Field format: <field>:<value> (e.g., track:Ferris Wheel).
