@@ -26,7 +26,13 @@ def index():
 
 @app.route('/login')
 def login():
-    scope = 'user-read-playback-state user-modify-playback-state user-read-currently-playing'
+    scope = (
+        'user-read-playback-state '
+        'user-modify-playback-state '
+        'user-read-currently-playing '
+        'playlist-read-private '
+        'playlist-read-collaborative'
+    )
     
     params = {
         'client_id' : CLIENT_ID,

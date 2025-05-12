@@ -17,6 +17,7 @@ class SpotifyTools:
                 NewJeans
                 Yorushika
                 Ai Tomioka
+                LiSA
                 ReoNa
                 Riria
                 Query construction rules:
@@ -32,4 +33,22 @@ class SpotifyTools:
                 Input: "Play any song by Reona" → Query: artist:"ReoNa"
                 Input: "Play track with ISRC code KRA382401950" → Query: "isrc:KRA382401950"
         """
+        )
+    def create_get_my_playlists_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.get_my_playlists,
+            name="get_my_playlists",
+            description="Use this tool to refresh and retrieve the playlists saved on your Spotify client. This is to be used when the user wants to refresh the save of the playlists."
+        )
+    def create_play_playlist_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.play_playlist,
+            name="play_playlist",
+            description="Use this tool to play a specific playlist from your Spotify client. This tool wants the name of the playlist as the input, and it will play the playlist from Spotify."
+        )
+    def create_shuffle_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.shuffle,
+            name='shuffle',
+            description='Turns on or off Shuffling for the current playback on spotify. The function wants true to turn on shuffling, and false to turn off shuffling.'
         )

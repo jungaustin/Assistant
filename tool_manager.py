@@ -9,6 +9,9 @@ class ToolManager:
         self.tools = [
             self.spotify_tools.create_play_song_tool(),
             self.generic_tools.create_open_app_tool(),
+            self.spotify_tools.create_play_playlist_tool(),
+            self.spotify_tools.create_get_my_playlists_tool(),
+            self.spotify_tools.create_shuffle_tool(),
         ]
         
     def get_tools(self):

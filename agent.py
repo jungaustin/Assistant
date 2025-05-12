@@ -17,6 +17,7 @@ class Agent:
             There is no need to repeat the question back to me.
             Try your best to keep your responses short. More information is not necessary unless I ask.
             If I ask you to do a task that requires a tool, do your best to give 0 or 1 word answers. For example, if i ask you to play a song, there is no need for a response unless the song was not able to be played for some reason.
+            Feel free to use multiple tool calls if necessary. For example, if the user asks to shuffle a playlist, you would first play the playlist in quetion with a play playlist tool call, and then use a shuffle tool call.
 
             Here are example questions and answers to guide your responses:
 
@@ -49,9 +50,9 @@ class Agent:
         input_message = HumanMessage(content=input_text)
         print('here')
         result = self.graph.invoke({"messages": [input_message]}, self.config)
-        # for msg in result["messages"]:
-        #     print(msg.type + ":" + msg.content)
-        #     yield msg.content
+        for msg in result["messages"]:
+            print(msg.type + ":" + msg.content)
+            # yield msg.content
         return result["messages"][-1].content
 
     def build_graph(self):

@@ -2,6 +2,7 @@ import requests
 import urllib.parse
 
 from datetime import datetime, timedelta
+from rapidfuzz import process
 # from flask import Flask, redirect, request, jsonify, session
 
 import os
@@ -18,6 +19,7 @@ class SpotifyClient:
         self.expires_at = None
         self.API_BASE_URL = 'https://api.spotify.com/v1'
         self.TOKEN_URL = 'https://accounts.spotify.com/api/token'
+        self.playlists = None
     
     def is_token_valid(self):
         return self.access_token is not None and datetime.now().timestamp() < self.expires_at
@@ -58,10 +60,7 @@ class SpotifyClient:
         
         if self.device_id is None:
             self.get_device_id()
-        
-        print()
-        print("query: " + query)
-        print()
+
         search = requests.get(
             self.API_BASE_URL + '/search',
             headers=self.get_headers(),
@@ -90,6 +89,96 @@ class SpotifyClient:
             return "Successfully started playing the requested song"
         else:
             return f"Failed to play song. Status code: {response.status_code}"
+    
+    def get_my_playlists(self):
+        if not self.is_token_valid():
+            self.refresh_token()
+
+        if self.device_id is None:
+            self.get_device_id()
+
+        offset = 0
+        params={
+            'limit': 50,
+            'offset': offset,
+        }
+        
+        my_playlists = {}
+        
+        while(True):
+            search = requests.get(
+                self.API_BASE_URL + '/me/playlists',
+                headers=self.get_headers(),
+                params=params
+            )
+            search_res = search.json()
+            items = search_res.get('items', {})
+            if search.status_code != 200:
+                return (f"Error fetching playlists: {search.status_code} - {search.text}")
+            for item in items:
+                print(item)
+                my_playlists[item['name']] = item['uri']
+            if(len(items) < 50):
+                break
+            offset += 50
+        self.playlists = my_playlists
+        return self.playlists.keys
+
+    def get_best_playlist_match(self, user_input: str, threshold=70) -> str | None:
+        print("h2")
+        result = process.extractOne(user_input, self.playlists.keys(), score_cutoff=threshold)
+        print(result[0] if result else None)
+        return result[0] if result else None
+    
+    def play_playlist(self, input : str) -> str:
+        if not self.is_token_valid():
+            self.refresh_token()
+        
+        if self.device_id is None:
+            self.get_device_id()
+
+        if(self.playlists == None):
+            _ = self.get_my_playlists()
+        playlist_name = self.get_best_playlist_match(input)
+        if playlist_name is None:
+            return f"No matching playlist found for '{input}'."
+        
+        playlist_uri = self.playlists[playlist_name]
+        data = {
+            'context_uri': playlist_uri,
+            'position_ms': 0,
+        }
+        response = requests.put(
+            self.API_BASE_URL + '/me/player/play' + f'?device_id={self.device_id}',
+            headers=self.get_headers(),
+            json=data
+        )
+        if response.status_code == 204:
+            return f"Playlist '{playlist_name}' is now playing."
+        else:
+            print(response)
+            return f"Failed to play playlist. Status code: {response.status_code}"
+    
+    def shuffle(self, state : bool) -> str:
+        print(state)
+        print(type(state))
+        if not self.is_token_valid():
+            self.refresh_token()
+        
+        if self.device_id is None:
+            self.get_device_id()
+            
+        response = requests.put(
+            self.API_BASE_URL + '/me/player/shuffle', 
+            headers=self.get_headers(),
+            params={'state': state, 'device_id': self.device_id}
+        )
+        if response.status_code > 199 and response.status_code < 300:
+            return f"It worked."
+        else:
+            print(response)
+            return f"Failed to shuffle"
+
 
 # def queue_song():
 #     if 'access_token' not in session:
