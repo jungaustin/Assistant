@@ -32,7 +32,7 @@ An extensible AI assistant powered by large language models and tool integration
 
 | Tool        | Description                        |
 |-------------|------------------------------------|
-| Spotify     | (WIP) Plays music via natural commands   |
+| Spotify     | Plays music via natural commands   |
 | Web Search  | (Planned) Fetches live data        |
 | Calendar    | (Planned) Schedules tasks          |
 | Speech      | Real-time speech input/output (TextToSpeech + SpeechToText), with Open-Wake-Word integration |
