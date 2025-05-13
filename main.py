@@ -1,7 +1,6 @@
 # Try again to use the better open wake word model cause its kinda bad
 # Create play/pause feature
 
-# Currently two things that are wrong. Firstly, If the app is not open already, it opens it but it takes awhile so It gets a status error cause the app isnt open so it cant play. Secondly, The Text to Speech Highlights ALL of the thoughts of the agent, instead of just the final thought, so It repeats what I ask it to.
 # Maybe make the opening of the app a different tool, so I can say "and" and have it do both. 
 
 # currently only working when something is already being played so handle pause/start playback

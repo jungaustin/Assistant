@@ -52,3 +52,15 @@ class SpotifyTools:
             name='shuffle',
             description='Turns on or off Shuffling for the current playback on spotify. The function wants true to turn on shuffling, and false to turn off shuffling.'
         )
+    def create_pause_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.pause_playback,
+            name='pause_playback',
+            description='Pauses the playback on spotify. This makes it so that the spotify app stops playing the song until it is resumed.'
+        )
+    def create_play_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.play_playback,
+            name='play_playback',
+            description='Resumes the playback on spotify. This makes it so that the spotify app starts playing music. This function is to be used when the user wants to play music, start music, or resume music, without any other information given.'
+        )

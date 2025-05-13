@@ -158,7 +158,10 @@ class SpotifyClient:
             'position_ms': 0,
         }
         response = requests.put(
-            self.API_BASE_URL + '/me/player/play' + f'?device_id={self.device_id}',
+            self.API_BASE_URL + '/me/player/play',
+            params={
+                'device_id': self.device_id
+                },
             headers=self.get_headers(),
             json=data
         )
@@ -185,6 +188,46 @@ class SpotifyClient:
         else:
             print(response)
             return f"Failed to shuffle"
+    
+    def pause_playback(self) -> str:
+        if not self.is_token_valid():
+            self.refresh_token()
+        
+        if self.device_id is None:
+            self.get_device_id()
+        
+        response = requests.put(
+            self.API_BASE_URL + '/me/player/pause',
+            headers=self.get_headers(),
+            params={
+                'device_id': self.device_id
+            }
+        )
+        
+        if response.status_code > 199 or response.status_code < 300:
+            return "Paused"
+        else:
+            return f"An Error has Occured: Status Code {response.status_code}"
+        
+    def play_playback(self) -> str:
+        if not self.is_token_valid():
+            self.refresh_token()
+        
+        if self.device_id is None:
+            self.get_device_id()
+        
+        response = requests.put(
+            self.API_BASE_URL + '/me/player/play',
+            headers=self.get_headers(),
+            params={
+                'device_id': self.device_id
+            }
+        )
+        
+        if response.status_code > 199 or response.status_code < 300:
+            return "Started playback"
+        else:
+            return f"An error has occured: Status Code {response.status_code}"
 
 
 # def queue_song():
