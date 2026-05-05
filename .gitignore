@@ -1,7 +1,46 @@
+# Environment variables
 .env
-/custom_wakewords
-/__pycache__
-/pyaudio_portaudio
-/.vscode
-realtimesst.log
-req.txt
+.env.local
+.env*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Project artifacts
+*.log
+*.onnx
+/models/
+/state/
+/custom_wakewords/
+/pyaudio_portaudio/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+test1.py
+test3.py
+testing.py
+Reliable Ai Agent With LangGraph Following.py
+
+# Third-party
+node_modules/

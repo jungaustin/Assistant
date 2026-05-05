@@ -1,42 +1,105 @@
-# Try again to use the better open wake word model cause its kinda bad
-# Create play/pause feature
+"""Edge runtime: mic + speaker (eventually camera) on one side, a Brain on
+the other, with a Transport in between. Runs in-process today; swap the
+transport for a WebSocket version in Phase 5 without touching this file.
+"""
 
-# Maybe make the opening of the app a different tool, so I can say "and" and have it do both. 
+import asyncio
 
-# currently only working when something is already being played so handle pause/start playback
-
-#Credit Sylvester Seo For helping 
-
-
-
-from llm import LLMInteractions
-from tts import TextToSpeech
-from stt import SpeechToText
 from agent import Agent
-from tool_manager import ToolManager
+from config import FOLLOWUP_WINDOW_SECONDS
+from latency import probe
+from privacy import MicGate
+from stt import SpeechToText
+from transport import InProcessTransport
+from tts import TextToSpeech
 
-class Assistant:
-    def __init__(self):
-        self.tool_manager = ToolManager()
-        self.agent = Agent()
+
+class Edge:
+    def __init__(self, transport, mic_gate: MicGate | None = None):
+        self.transport = transport
+        self.mic_gate = mic_gate or MicGate()
         self.speech_to_text = SpeechToText()
         self.text_to_speech = TextToSpeech()
-    
-    def process_text(self, text):
-        print(text)
-    
-    def handle_input(self, text):
-        ans = self.agent.run(text)
-        self.process_text(ans)
-    
-    def run(self):
+
+    async def _listen_once(self) -> str | None:
+        if not self.mic_gate.enabled:
+            await asyncio.sleep(0.2)
+            return None
+        text = await asyncio.to_thread(self.speech_to_text.listen)
+        if text:
+            probe.mark_stt_finish()
+        return text
+
+    async def _listen_followup(self, timeout: float) -> str | None:
+        """Listen for a follow-up utterance without requiring the wake word.
+        Returns None on silence/timeout. MicGate still applies.
+        """
+        if not self.mic_gate.enabled:
+            return None
+        self.speech_to_text.wakeup()
+        listen_task = asyncio.create_task(
+            asyncio.to_thread(self.speech_to_text.listen)
+        )
+        try:
+            text = await asyncio.wait_for(listen_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.speech_to_text.abort()
+            try:
+                await listen_task
+            except Exception:
+                pass
+            return None
+        if text:
+            probe.mark_stt_finish()
+        return text
+
+    async def _speak_stream(self, token_iter):
+        # RealtimeTTS' .feed() accepts a sync iterator and starts playing as
+        # tokens arrive, so we bridge the async stream into a thread-safe
+        # blocking queue and hand that queue to the TTS engine.
+        import queue
+
+        q: queue.Queue = queue.Queue(maxsize=64)
+        sentinel = object()
+
+        def sync_iter():
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    return
+                yield item
+
+        async def pump():
+            async for token in token_iter:
+                probe.mark_brain_first_token()
+                await asyncio.to_thread(q.put, token)
+            await asyncio.to_thread(q.put, sentinel)
+
+        pump_task = asyncio.create_task(pump())
+        await asyncio.to_thread(self.text_to_speech.speak, sync_iter())
+        await pump_task
+
+    async def run(self):
+        print("listening")
         while True:
-            print('listening')
-            user_input = self.speech_to_text.listen()
-            response = self.agent.run(user_input)
-            self.text_to_speech.speak(response)
+            utterance = await self._listen_once()
+            if not utterance:
+                continue
+            while utterance:
+                print(f"user: {utterance}")
+                tokens = self.transport.respond(utterance)
+                await self._speak_stream(tokens)
+                print(f"follow-up window ({FOLLOWUP_WINDOW_SECONDS:.0f}s)")
+                utterance = await self._listen_followup(FOLLOWUP_WINDOW_SECONDS)
+            print("listening")
 
-if __name__ == '__main__':
-    assistant = Assistant()
-    assistant.run()
 
+async def amain():
+    brain = Agent()
+    transport = InProcessTransport(brain)
+    edge = Edge(transport)
+    await edge.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(amain())

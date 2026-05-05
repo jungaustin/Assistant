@@ -1,15 +1,15 @@
 from tool_manager import ToolManager
-from llm import LLMInteractions
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
-from langgraph.graph import START, StateGraph, MessagesState, END
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import START, StateGraph, MessagesState
 from langgraph.prebuilt import tools_condition, ToolNode
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from config import make_llm
+import uuid
 
 class Agent:
-    def __init__(self, llm = None):
+    def __init__(self, llm=None, thread_id=None):
         self.tools = ToolManager().get_tools()
-        llm = llm or ChatOpenAI()
+        llm = llm if llm is not None else make_llm()
         self.llm = llm.bind_tools(self.tools)
         self.system_message = SystemMessage(content="""You are Nemo, a friendly and capable AI assistant.
             You help the user with daily tasks, answer questions, and offer thoughtful advice.
@@ -38,23 +38,30 @@ class Agent:
             Answer: Got it! I'll remind you.
             """)
         self.memory = MemorySaver()
-        self.config = {"configurable" : {"thread_id": "1"}}
+        self.config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
         self.graph = self.build_graph()
     
-    # def run_llm(self, state: MessagesState):
-    #     updated_messages = [self.system_message] + state["messages"]
-    #     response = self.llm.invoke(updated_messages)
-    #     return {"messages": state["messages"] + [response]}
-    
-    def run(self, input_text):
-        print(input_text)
+    def stream(self, input_text):
+        """Yield assistant token strings as the LLM produces them.
+
+        Tool-call messages and non-text content parts are skipped so the
+        generator is safe to feed straight into TextToSpeech.speak().
+        """
         input_message = HumanMessage(content=input_text)
-        print('here')
-        result = self.graph.invoke({"messages": [input_message]}, self.config)
-        for msg in result["messages"]:
-            print(msg.type + ":" + msg.content)
-            # yield msg.content
-        return result["messages"][-1].content
+        for chunk, metadata in self.graph.stream(
+            {"messages": [input_message]},
+            self.config,
+            stream_mode="messages",
+        ):
+            if metadata.get("langgraph_node") != "assistant":
+                continue
+            text = _content_to_text(getattr(chunk, "content", None))
+            if text:
+                yield text
+
+    def run(self, input_text):
+        """Non-streaming convenience wrapper: returns the full response string."""
+        return "".join(self.stream(input_text))
 
     def build_graph(self):
         def assistant(state: MessagesState):
@@ -64,13 +71,27 @@ class Agent:
         builder.add_node("assistant", assistant)
         builder.add_node("tools", ToolNode(self.tools))
         builder.add_edge(START, "assistant")
-        builder.add_conditional_edges(
-            "assistant",
-            tools_condition,
-            # {
-            #     "tools": "tools",
-            #     "__end__": END
-            # } # I am here considering deleting this or not
-        )
+        builder.add_conditional_edges("assistant", tools_condition)
         builder.add_edge("tools", "assistant")
-        return builder.compile(checkpointer = self.memory)
+        return builder.compile(checkpointer=self.memory)
+
+
+def _content_to_text(content) -> str:
+    # LangChain message content can be a string OR a list of parts (dicts/strings)
+    # for tool-using/multimodal models. Collapsing it here avoids the
+    # `msg.type + ":" + msg.content` TypeError when content is a list.
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                t = part.get("text")
+                if t:
+                    parts.append(t)
+        return "".join(parts)
+    return str(content)

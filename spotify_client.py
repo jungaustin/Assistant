@@ -141,6 +141,8 @@ class SpotifyClient:
         if(self.playlists == None):
             _ = self.get_my_playlists()
         
+        playlist_name = None
+        
         for name in self.playlists.keys():
             if input.strip().lower() == name.strip().lower():
                 playlist_name = name
@@ -204,7 +206,7 @@ class SpotifyClient:
             }
         )
         
-        if response.status_code > 199 or response.status_code < 300:
+        if 200 <= response.status_code < 300:
             return "Paused"
         else:
             return f"An Error has Occured: Status Code {response.status_code}"
@@ -224,7 +226,7 @@ class SpotifyClient:
             }
         )
         
-        if response.status_code > 199 or response.status_code < 300:
+        if 200 <= response.status_code < 300:
             return "Started playback"
         else:
             return f"An error has occured: Status Code {response.status_code}"

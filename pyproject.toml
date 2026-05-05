@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot"
+version = "0.1.0"
+description = "Voice-driven desk companion. Pi-shaped Edge talks to Mac-shaped Brain over Wi-Fi."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Austin Jung", email = "jungaustin@gmail.com" }]
+
+dependencies = [
+    "aiofiles",
+    "aiohttp",
+    "langchain>=0.0.332",
+    "langchain-core",
+    "langchain-openai",
+    "langgraph",
+    "langsmith",
+    "onnxruntime",
+    "openai>=0.28",
+    "openwakeword>=0.6",
+    "piper-tts>=1.4.0",
+    "python-dotenv",
+    "rapidfuzz",
+    "RealtimeSTT",
+    "requests",
+    "rich",
+    "sounddevice>=0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.black]
+line-length = 88
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+# pyaudio's PyPI wheel is built with -flat_namespace and fails to find
+# Homebrew's libportaudio at runtime ('_PaMacCore_SetupChannelMap'). Force
+# a from-source build so it links directly against /opt/homebrew/lib.
+[tool.uv]
+no-binary-package = ["pyaudio"]
+# Resolve only for the local platform (Mac arm64) — openwakeword pulls
+# tflite-runtime on Linux, which has no Linux/cp312 wheels yet.
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]

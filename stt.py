@@ -1,15 +1,17 @@
-import atexit
-from RealtimeSTT import AudioToTextRecorder
+from config import make_stt_recorder
+
 
 class SpeechToText:
-    def __init__(self):
-        self.recorder = AudioToTextRecorder(
-            enable_realtime_transcription=True,
-            realtime_processing_pause=0.1,
-            wakeword_backend="oww",
-            openwakeword_model_paths="custom_wakewords/nemo.onnx",
-            openwakeword_inference_framework="onnx",
-        )
-    
+    def __init__(self, recorder=None):
+        self.recorder = recorder if recorder is not None else make_stt_recorder()
+
     def listen(self):
         return self.recorder.text()
+
+    def wakeup(self):
+        """Bypass the wake-word gate for the next utterance."""
+        self.recorder.wakeup()
+
+    def abort(self):
+        """Stop the current listen() call."""
+        self.recorder.abort()

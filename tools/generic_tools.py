@@ -1,5 +1,5 @@
 import subprocess
-from langchain.tools import StructuredTool, BaseTool
+from langchain_core.tools import StructuredTool, BaseTool
 
 class GenericTools:
     @staticmethod
