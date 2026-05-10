@@ -36,19 +36,22 @@ class Edge:
         """
         if not self.mic_gate.enabled:
             return None
-        self.speech_to_text.wakeup()
-        listen_task = asyncio.create_task(
-            asyncio.to_thread(self.speech_to_text.listen)
-        )
+        self.speech_to_text.set_wake_word_bypass(timeout)
         try:
-            text = await asyncio.wait_for(listen_task, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.speech_to_text.abort()
+            listen_task = asyncio.create_task(
+                asyncio.to_thread(self.speech_to_text.listen)
+            )
             try:
-                await listen_task
-            except Exception:
-                pass
-            return None
+                text = await asyncio.wait_for(listen_task, timeout=timeout)
+            except asyncio.TimeoutError:
+                self.speech_to_text.abort()
+                try:
+                    await listen_task
+                except Exception:
+                    pass
+                return None
+        finally:
+            self.speech_to_text.set_wake_word_bypass(0.0)
         if text:
             probe.mark_stt_finish()
         return text

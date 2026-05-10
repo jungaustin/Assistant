@@ -8,10 +8,12 @@ class SpeechToText:
     def listen(self):
         return self.recorder.text()
 
-    def wakeup(self):
-        """Bypass the wake-word gate for the next utterance."""
-        self.recorder.wakeup()
-
     def abort(self):
         """Stop the current listen() call."""
         self.recorder.abort()
+
+    def set_wake_word_bypass(self, seconds: float) -> None:
+        """Allow voice without the wake word for `seconds` after the next
+        listen() begins. Set to 0.0 to require the wake word again.
+        """
+        self.recorder.wake_word_activation_delay = seconds
