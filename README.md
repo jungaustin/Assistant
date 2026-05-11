@@ -60,14 +60,18 @@ Required for Spotify: `CLIENT_ID`, `CLIENT_SECRET`, `REFRESH_TOKEN`.
 Provider selection — providers are explicit, unknown values raise:
 
 ```
-LLM_PROVIDER=openai      # openai | ollama
+LLM_PROVIDER=openai-compat   # openai-compat | ollama
 LLM_MODEL=gpt-4o-mini
+BRAIN_BASE_URL=              # blank = OpenAI; http://localhost:11434/v1 = Ollama
+BRAIN_API_KEY=               # blank = falls back to OPENAI_API_KEY
 OPENAI_API_KEY=...
 
-TTS_PROVIDER=openai      # openai | coqui | piper
+TTS_PROVIDER=openai          # openai | coqui | piper
 STT_PROVIDER=realtimestt
 STT_MODEL=small.en
 ```
+
+Swapping LLM providers is one env var: point `BRAIN_BASE_URL` at any OpenAI-compatible endpoint (Ollama at `/v1`, vLLM, Together). For local tool-calling, pull a tool-capable model like `qwen2.5:32b`.
 
 Privacy:
 
