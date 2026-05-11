@@ -4,9 +4,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai-compat").lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# OpenAI-compatible base URL. Defaults to OpenAI itself; point at Ollama
+# (http://localhost:11434/v1), Together, vLLM, etc. to swap providers.
+BRAIN_BASE_URL = os.getenv("BRAIN_BASE_URL") or None
+BRAIN_API_KEY = os.getenv("BRAIN_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "openai").lower()
 TTS_VOICE = os.getenv("TTS_VOICE", "")
@@ -26,15 +30,19 @@ FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
 
 def make_llm():
     """Build the chat LLM. No silent default to cloud — provider is explicit."""
-    if LLM_PROVIDER == "openai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=LLM_MODEL, streaming=True)
+    if LLM_PROVIDER == "openai-compat":
+        from brain.openai_compat import OpenAICompatChat
+        return OpenAICompatChat(
+            model=LLM_MODEL,
+            base_url=BRAIN_BASE_URL,
+            api_key=BRAIN_API_KEY,
+        )
     if LLM_PROVIDER == "ollama":
         from langchain_ollama import ChatOllama
         return ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
     raise ValueError(
         f"Unknown LLM_PROVIDER={LLM_PROVIDER!r}. "
-        f"Set LLM_PROVIDER=openai or LLM_PROVIDER=ollama in .env."
+        f"Set LLM_PROVIDER=openai-compat or LLM_PROVIDER=ollama in .env."
     )
 
 

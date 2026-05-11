@@ -113,23 +113,23 @@ One client, many providers. Phase 4's `langchain-openai` removal is bundled
 in here since it falls out for free once we stop using `ChatOpenAI`.
 
 ### 2.1 Direct OpenAI SDK usage
-- [ ] Add `openai` to `pyproject.toml` (already a transitive dep — make it explicit)
-- [ ] Write a small `brain/openai_compat.py` that:
-  - [ ] Wraps `openai.AsyncOpenAI(base_url=..., api_key=...)`
-  - [ ] Exposes a `stream(messages, tools) -> AsyncIterator[token | tool_call]` method matching the Brain protocol
-- [ ] Add a `BRAIN_BASE_URL` env var (defaults to OpenAI's URL)
-- [ ] Update `config.make_llm()` to return this client when `LLM_PROVIDER=openai-compat`
+- [x] Add `openai` to `pyproject.toml` (already a transitive dep — make it explicit; floor bumped to `>=1.40` for v1 client)
+- [x] Write a small `brain/openai_compat.py` that:
+  - [x] Wraps `openai.OpenAI(base_url=..., api_key=...)` (sync — LangGraph's `stream_mode="messages"` drives sync `_stream`; can revisit AsyncOpenAI if/when the agent goes async end-to-end)
+  - [x] Exposes a LangChain-compatible `BaseChatModel` with `bind_tools`, `_generate`, and `_stream` so the existing StateGraph just works
+- [x] Add `BRAIN_BASE_URL` and `BRAIN_API_KEY` env vars (BRAIN_API_KEY falls back to OPENAI_API_KEY; unset BRAIN_BASE_URL = OpenAI default)
+- [x] Update `config.make_llm()` to return this client when `LLM_PROVIDER=openai-compat` (now the default)
 
 ### 2.2 Hook the new client into the agent
-- [ ] LangGraph still wraps the brain — keep the StateGraph + ToolNode for now
-- [ ] Bridge: write a thin LangChain-compatible adapter around the new client (or use LangGraph's native message handling) so the existing graph still works
-- [ ] Run `just run` against OpenAI — verify nothing regressed
-- [ ] Set `BRAIN_BASE_URL=http://localhost:11434/v1`, `LLM_MODEL=qwen2.5:32b`, run Ollama locally — verify it talks to Ollama
+- [x] LangGraph still wraps the brain — keep the StateGraph + ToolNode for now
+- [x] Bridge: thin LangChain `BaseChatModel` adapter (`OpenAICompatChat`) around the openai SDK so the existing graph still works
+- [x] Run `just run` against OpenAI — verified end-to-end including a tool call (`Pause spotify.` round-trips through ToolNode)
+- [x] Set `BRAIN_BASE_URL=http://localhost:11434/v1`, ran Ollama locally — verified streaming. Tool calls require a tool-capable model (qwen2.5, not llama3/mistral); transport itself is verified.
 
 ### 2.3 Strip langchain-openai (was Phase 4, now bundled here)
-- [ ] Confirm no remaining import of `langchain_openai`
-- [ ] Remove `langchain-openai` from `pyproject.toml`
-- [ ] Re-run `uv lock` and `just run` — should still work
+- [x] Confirm no remaining import of `langchain_openai`
+- [x] Remove `langchain-openai` from `pyproject.toml`
+- [x] Re-run `uv lock` and `just run` — still works (lock dropped `langchain-openai`, `regex`, `tiktoken`)
 
 **Done when:** Flipping `BRAIN_BASE_URL` is the only change needed to swap between OpenAI and Ollama. No `langchain_openai` in the dep tree.
 
