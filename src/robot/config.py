@@ -31,7 +31,7 @@ FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
 def make_llm():
     """Build the chat LLM. No silent default to cloud — provider is explicit."""
     if LLM_PROVIDER == "openai-compat":
-        from brain.openai_compat import OpenAICompatChat
+        from robot.brain.openai_compat import OpenAICompatChat
         return OpenAICompatChat(
             model=LLM_MODEL,
             base_url=BRAIN_BASE_URL,
@@ -55,7 +55,7 @@ def make_tts_engine():
         from RealtimeTTS import CoquiEngine
         return CoquiEngine()
     if TTS_PROVIDER == "piper":
-        from engines.piper_engine import PiperEngine
+        from robot.engines.piper_engine import PiperEngine
         return PiperEngine(voice_path=PIPER_VOICE_PATH)
     raise ValueError(
         f"Unknown TTS_PROVIDER={TTS_PROVIDER!r}. "

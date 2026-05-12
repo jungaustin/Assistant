@@ -15,7 +15,7 @@ import numpy as np
 import sounddevice as sd
 from piper import PiperVoice
 
-from latency import probe
+from robot.latency import probe
 
 
 TextLike = Union[str, Iterable[str], Iterator[str]]

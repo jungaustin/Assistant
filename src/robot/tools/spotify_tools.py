@@ -1,4 +1,4 @@
-from spotify_client import SpotifyClient
+from robot.spotify_client import SpotifyClient
 from langchain_core.tools import StructuredTool, BaseTool
 import subprocess
 

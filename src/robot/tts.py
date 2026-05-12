@@ -1,5 +1,5 @@
 import atexit
-from config import make_tts_engine
+from robot.config import make_tts_engine
 
 
 class TextToSpeech:
