@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +28,27 @@ MIC_ENABLED_DEFAULT = os.getenv("MIC_ENABLED", "true").lower() == "true"
 MAX_UTTERANCE_SECONDS = int(os.getenv("MAX_UTTERANCE_SECONDS", "30"))
 CAMERA_LOG_PATH = os.getenv("CAMERA_LOG_PATH", "camera_access.log")
 FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
+
+# Persona system prompt. Swap the file (or PERSONA_PATH) to give the agent a
+# different personality without touching code.
+PERSONA_PATH = os.getenv("PERSONA_PATH", "personas/nemo.md")
+
+
+def load_persona() -> str:
+    """Read the persona file and return its contents.
+
+    Resolved relative to the current working directory (justfile runs from
+    robot/, where personas/ lives). Raises FileNotFoundError with a clear
+    message if the file is missing — silent fallback to a hardcoded prompt
+    would mask the misconfiguration.
+    """
+    path = Path(PERSONA_PATH)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Persona file not found at {path.resolve()}. "
+            f"Set PERSONA_PATH in .env or create the file."
+        )
+    return path.read_text(encoding="utf-8")
 
 
 def make_llm():
