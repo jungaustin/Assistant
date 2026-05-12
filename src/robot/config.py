@@ -55,7 +55,7 @@ def make_tts_engine():
         from RealtimeTTS import CoquiEngine
         return CoquiEngine()
     if TTS_PROVIDER == "piper":
-        from robot.engines.piper_engine import PiperEngine
+        from robot.voice.engines.piper_engine import PiperEngine
         return PiperEngine(voice_path=PIPER_VOICE_PATH)
     raise ValueError(
         f"Unknown TTS_PROVIDER={TTS_PROVIDER!r}. "

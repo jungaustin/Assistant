@@ -5,13 +5,13 @@ transport for a WebSocket version in Phase 5 without touching this file.
 
 import asyncio
 
-from robot.agent import Agent
+from robot.brain import Agent
 from robot.config import FOLLOWUP_WINDOW_SECONDS
 from robot.latency import probe
 from robot.privacy import MicGate
-from robot.stt import SpeechToText
+from robot.ear import SpeechToText
 from robot.transport import InProcessTransport
-from robot.tts import TextToSpeech
+from robot.voice import TextToSpeech
 
 
 class Edge:
