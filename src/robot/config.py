@@ -96,7 +96,7 @@ def make_stt_recorder():
             realtime_processing_pause=0.1,
             wake_words="nemo",
             wakeword_backend="oww",
-            openwakeword_model_paths="custom_wakewords/nemo.onnx",
+            openwakeword_model_paths="models/wake/nemo.onnx",
             openwakeword_inference_framework="onnx",
         )
     raise ValueError(
