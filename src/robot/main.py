@@ -57,10 +57,14 @@ class Edge:
         return text
 
     async def _speak_stream(self, token_iter):
-        # RealtimeTTS' .feed() accepts a sync iterator and starts playing as
-        # tokens arrive, so we bridge the async stream into a thread-safe
-        # blocking queue and hand that queue to the TTS engine.
+        # Pipeline: Agent token stream → chunker → blocking queue → TTS engine.
+        # The chunker emits phrase-sized strings so every engine (Piper,
+        # OpenAI, Coqui) gets the same well-formed input. Engines that did
+        # their own ad-hoc chunking now see chunks that already end at a
+        # boundary, so the internal chunking is a no-op.
         import queue
+
+        from robot.core.chunker import achunk_tokens
 
         q: queue.Queue = queue.Queue(maxsize=64)
         sentinel = object()
@@ -72,10 +76,18 @@ class Edge:
                     return
                 yield item
 
-        async def pump():
-            async for token in token_iter:
+        async def first_token_marker(aiter):
+            # Wrap the token iterator so we can fire the latency probe on
+            # the first token BEFORE the chunker buffers it. The chunker
+            # holds tokens until a boundary; marking inside it would
+            # mismeasure (we want brain-first-token, not chunker-first-flush).
+            async for token in aiter:
                 probe.mark_brain_first_token()
-                await asyncio.to_thread(q.put, token)
+                yield token
+
+        async def pump():
+            async for chunk in achunk_tokens(first_token_marker(token_iter)):
+                await asyncio.to_thread(q.put, chunk)
             await asyncio.to_thread(q.put, sentinel)
 
         pump_task = asyncio.create_task(pump())
