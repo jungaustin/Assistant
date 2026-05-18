@@ -233,23 +233,25 @@ and prod. No more "the namespace is the filesystem."
 **What was cut:** The full Conductor state machine and the full component refactor onto the bus. The current imperative loop in `main.py` is fine for now — the state machine is mostly useful when 3+ components are racing for control, and you have 2 (Ear, Voice). Refactoring components onto the bus is foundation work for Phase 8, but only the *parts* that cross the network boundary matter — internal calls between Ear↔Voice can stay direct.
 
 ### 5.1 Sentence chunker (do this first — biggest user-visible win)
-- [ ] `core/chunker.py` — accepts an async iterator of tokens, yields phrase-sized chunks
-- [ ] Boundaries: `. ! ? ,` or length threshold (~80 chars, tunable)
-- [ ] Pipe `Agent.stream()` → chunker → `TextToSpeech.speak()`
-- [ ] Measure first-audio latency before/after — record in "Measurements"
+- [x] `core/chunker.py` — `chunk_tokens` (sync) + `achunk_tokens` (async); 80-char force-flush at last whitespace
+- [x] Boundaries: `. ! ? ,` + `\n`; force-flush at MAX_CHARS=80
+- [x] Pipe `Agent.stream()` → `achunk_tokens` → `TextToSpeech.speak()` inside `main.Edge._speak_stream`. brain-first-token latency probe still fires on the first raw token (otherwise it'd mismeasure as brain+chunker).
+- [ ] Measure first-audio latency before/after — requires real mic + voice loop; see Measurements section below.
+- [x] 20 chunker tests (`tests/test_chunker.py`) covering hard/soft boundaries, multi-boundary single tokens, length force-flush, pathological no-whitespace, partial tokens, decimals (don't split), abbreviations (do split — acceptable), end-of-stream drain, async/sync equivalence.
 
 ### 5.2 Events
-- [ ] `core/events.py` — pydantic models for `WakeDetected`, `TranscriptReady`, `BrainToken`, `BrainToolCall`, `SpeakChunk`, `Error`, `Heartbeat`
-- [ ] These are the wire format for Phase 8's WebSocket transport. Keep them serializable.
+- [x] `core/events.py` — pydantic v2 models for `WakeDetected`, `TranscriptReady`, `BrainToken`, `BrainToolCall`, `SpeakChunk`, `Heartbeat`, `Error`
+- [x] Each event has `type: Literal[...]` discriminator + `ts: datetime` (UTC) + `source: str`. Roundtrip through JSON via `TypeAdapter(Event)` verified for all 7 types; unknown `type` is rejected.
 
 ### 5.3 Simple bus
-- [ ] `core/bus.py` — async pub/sub on top of `asyncio.Queue` (single broadcast queue is fine for now; topic-per-queue if needed later)
-- [ ] Unit test: publish, multiple subscribers, no deadlocks
-- [ ] Don't refactor existing components onto it yet. The bus is here so Phase 8's WebSocket transport has somewhere to plug into.
+- [x] `core/bus.py` — fan-out async pub/sub on `asyncio.Queue`. One bounded queue per subscriber; **drop-oldest on backpressure** (a wedged consumer must never stall the voice loop). Late subscribers don't see prior events.
+- [x] 8 bus tests (`tests/test_bus.py`): single + multi-subscriber, no-replay, aclose unblocks blocked iterator, slow subscriber → exactly 8 drops with 10 publishes into a 2-deep queue, 50-event interleaved publish/consume in order.
+- [x] Components not yet refactored onto the bus (per the cut-down plan). Only Phase 8 boundary-crossing components need to migrate.
 
 ### 5.4 Heartbeats (was Phase 6.4 — moved here so Phase 8 has the foundation)
-- [ ] Each long-running component publishes `Heartbeat` events every N seconds
-- [ ] Lays the groundwork for Phase 8's reconnect logic — when the WebSocket drops, missing heartbeats are how the conductor will know
+- [x] `core/heartbeat.py` — `heartbeat_loop(bus, source, interval_s)` helper; cancellation is the normal shutdown signal.
+- [x] 3 heartbeat tests (`tests/test_heartbeat.py`): 50ms interval emits 3 events in ~200ms; cancellation exits cleanly; zero interval rejected.
+- [x] Long-running components don't publish yet — wires in during Phase 8 when they move onto the bus.
 
 ### Skipped (was originally Phase 5.2 and 5.4 — Office Hours, 2026-05-10)
 
@@ -435,11 +437,30 @@ Fill in as we go. The numbers tell us whether we're winning.
 
 | Metric | Before | After Phase 1 (Piper) | After Phase 5 (chunker) | Target |
 |---|---|---|---|---|
-| First-audio latency | _measure_ | 1331ms total (stt→token 1249ms, token→audio 82ms) | | <500ms |
+| First-audio latency | _measure_ | 1331ms total (stt→token 1249ms, token→audio 82ms) | _pending real voice loop_ | <500ms |
 | End-to-end response time | _measure_ | | | <2s perceived |
-| `requirements.txt` line count | ~40 | | | |
-| Direct `langchain*` deps | 3 | | | 0 |
-| Total deps in `uv.lock` | _measure_ | | | meaningfully smaller |
+| `requirements.txt` line count | ~40 | _file deleted in Phase 3_ | | n/a |
+| Direct `langchain*` deps | 3 | 2 after Phase 2.3 (`langchain` + `langchain-core`) | 2 | 0 (deferred — Phase 4 indefinitely) |
+| Total deps in `uv.lock` | _measure_ | dropped `langchain-openai`, `regex`, `tiktoken` in Phase 2.3 | added `pytest`, `pytest-asyncio`, `iniconfig`, `pluggy` (dev only) | meaningfully smaller |
+
+**Phase 5 chunker measurement is pending a real voice-loop turn.** The chunker
+moves token-buffering OUT of the engines and INTO a single upstream stage. Two
+mechanisms determine the win:
+
+1. **Earlier first-phrase delivery** for multi-boundary tokens. Some local
+   models emit whole sentences in one streaming delta (`"Hello. How are
+   you?"` as a single token). The old per-engine logic buffered the whole
+   token until the next delta arrived; the chunker splits inside the token
+   and emits the first phrase immediately.
+2. **Force-flush at 80 chars** for runs without natural punctuation. The old
+   PiperEngine had no length cap; a long run with no `. ! ? \n` would
+   buffer until end-of-stream. Chunker emits at 80 chars at the last
+   whitespace.
+
+To measure: run `just run`, say "nemo, hello" (short response — measures
+case 1) and "nemo, tell me a long story" (longer response — measures case
+2). The latency probe prints `total / stt→token / token→audio` per turn.
+Record token→audio here.
 
 ---
 
