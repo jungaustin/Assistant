@@ -33,20 +33,21 @@ class PiperEngine:
         self.sample_rate = self.voice.config.sample_rate
 
     def speak(self, text_or_generator: TextLike) -> None:
-        """Synthesize and play audio. With a generator, plays per chunk."""
+        """Synthesize and play audio.
+
+        With a generator, each item is treated as ALREADY a phrase-sized
+        chunk and synthesized immediately. The sentence chunker upstream
+        (robot.core.chunker) is the single source of phrasing truth; this
+        engine is a dumb synth-and-play sink. Earlier versions buffered
+        again here on `. ! ? \\n`, which silently discarded the chunker's
+        comma boundaries and force-flushes — wasting the latency win.
+        """
         if isinstance(text_or_generator, str):
             self._speak_text(text_or_generator)
             return
-        buffer = ""
-        for token in text_or_generator:
-            if not token:
-                continue
-            buffer += token
-            if any(buffer.endswith(p) for p in (". ", "! ", "? ", "\n")):
-                self._speak_text(buffer.strip())
-                buffer = ""
-        if buffer.strip():
-            self._speak_text(buffer.strip())
+        for chunk in text_or_generator:
+            if chunk and chunk.strip():
+                self._speak_text(chunk.strip())
 
     def _speak_text(self, text: str) -> None:
         if not text:
