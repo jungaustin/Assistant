@@ -1,6 +1,6 @@
-from spotify_client import SpotifyClient
-from tools.spotify_tools import SpotifyTools
-from tools.generic_tools import GenericTools
+from robot.tools.inner.spotify_client import SpotifyClient
+from robot.tools.inner.spotify_tools import SpotifyTools
+from robot.tools.inner.generic_tools import GenericTools
 class ToolManager:
     def __init__(self):
         spotify_client = SpotifyClient()

@@ -143,43 +143,53 @@ in here since it falls out for free once we stop using `ChatOpenAI`.
 and prod. No more "the namespace is the filesystem."
 
 ### 3.1 Move files into `src/robot/`
-- [ ] Create `src/robot/__init__.py`
-- [ ] Move every runtime module under `src/robot/`:
-  - [ ] `main.py` → `src/robot/main.py`
-  - [ ] `agent.py` → `src/robot/agent.py`
-  - [ ] `config.py` → `src/robot/config.py`
-  - [ ] `transport.py` → `src/robot/transport.py`
-  - [ ] `privacy.py` → `src/robot/privacy.py`
-  - [ ] `tts.py`, `stt.py`, `spotify_client.py`, `tool_manager.py`
-  - [ ] `tools/` → `src/robot/tools/`
-- [ ] Update imports to use the package path (`from robot.config import make_llm`)
-- [ ] Configure `pyproject.toml` `[tool.hatch.build.targets.wheel]` (or equivalent) to point at `src/robot`
-- [ ] `uv pip install -e .` — verify importable as `import robot`
+- [x] Create `src/robot/__init__.py`
+- [x] Move every runtime module under `src/robot/` (flat first, subpackages in 3.2):
+  - [x] `main.py` → `src/robot/main.py`
+  - [x] `agent.py` → `src/robot/agent.py` (later moved to `brain/agent.py` in 3.2)
+  - [x] `config.py` → `src/robot/config.py`
+  - [x] `transport.py` → `src/robot/transport.py` (later → `transport/inproc.py` in 3.2)
+  - [x] `privacy.py` → `src/robot/privacy.py` (later → `privacy/gate.py` in 3.2)
+  - [x] `tts.py`, `stt.py`, `spotify_client.py`, `tool_manager.py`, `latency.py`, `engines/`
+  - [x] `tools/` → `src/robot/tools/`
+- [x] Update imports to use the package path (incl. the two lazy imports inside `config.make_llm` / `make_tts_engine` that the obvious `^from` sed pattern missed)
+- [x] Configure `pyproject.toml` `[tool.hatch.build.targets.wheel]` to point at `src/robot`
+- [x] `uv sync` rebuilds the editable wheel; `import robot.brain` works from anywhere
+- [x] Scratch cleanup: deleted `test1.py`, `test3.py`, `testing.py`, `Reliable Ai Agent…`, `realtimesst.log`, and `requirements.txt` (uv.lock is authoritative)
+- [x] `justfile` updated: `just run` uses `python -m robot.main`; `just lint` runs `compileall` on `src/robot`
 
 ### 3.2 Subpackage layout
-- [ ] Split into the panel's recommended structure:
-  - [ ] `src/robot/core/` — placeholder for events, bus, conductor, chunker (Phase 5)
-  - [ ] `src/robot/ear/` — move STT here, define `ear/base.py` Protocol
-  - [ ] `src/robot/voice/` — move TTS here, define `voice/base.py` Protocol
-  - [ ] `src/robot/brain/` — move agent + openai_compat here, define `brain/base.py` Protocol
-  - [ ] `src/robot/transport/` — move transport.py here, plus `transport/base.py`
-  - [ ] `src/robot/privacy/` — move privacy.py here
-  - [ ] `src/robot/tools/inner/` — move spotify + apps tools here
-  - [ ] `src/robot/tools/outer/` — empty placeholder for Pipedream MCP
-- [ ] Each subpackage has an `__init__.py` re-exporting the public surface
+- [x] Split into the panel's recommended structure:
+  - [x] `src/robot/core/` — placeholder for events, bus, conductor, chunker (Phase 5)
+  - [x] `src/robot/ear/realtimestt.py` + `ear/base.py` (Ear Protocol)
+  - [x] `src/robot/voice/realtimetts.py` + `voice/base.py` (Voice Protocol); `engines/` folded under `voice/engines/`
+  - [x] `src/robot/brain/agent.py` + `brain/openai_compat.py` + `brain/base.py` (Brain Protocol)
+  - [x] `src/robot/transport/inproc.py` + `transport/base.py` (Transport Protocol)
+  - [x] `src/robot/privacy/gate.py`
+  - [x] `src/robot/tools/inner/` — `spotify_client.py`, `spotify_tools.py`, `generic_tools.py`
+  - [x] `src/robot/tools/outer/` — empty placeholder for Pipedream MCP
+  - [x] `src/robot/tools/manager.py` — `ToolManager` lives here (was top-level `tool_manager.py`)
+- [x] Each subpackage's `__init__.py` re-exports the public surface (e.g. `from robot.ear import SpeechToText`). `main.py` only imports from public surfaces.
+- [x] Protocols are `@runtime_checkable` and match what `main.Edge` actually calls today — not aspirational shapes.
+
+**Small deviations from the original plan (intentional):**
+- Modules inside each subpackage are named after the implementation (e.g. `ear/realtimestt.py`, not `ear/stt.py`). Future swap-ins (`ear/whisperx.py`, `voice/piper_direct.py`) sit alongside without renaming.
+- `latency.py` and `config.py` stayed at `src/robot/` root (cross-cutting helpers, no subpackage in the plan).
+- `tool_manager.py` → `tools/manager.py` rather than top-level — it's the tool subsystem's entry point.
+- `engines/` (only PiperEngine) folded into `voice/engines/` since TTS is the only consumer.
 
 ### 3.3 Persona as a file
-- [ ] Create `personas/nemo.md` at repo root
-- [ ] Move the system-prompt string from `agent.py:14-39` into it
-- [ ] `agent.py` reads `personas/nemo.md` at startup
-- [ ] `PERSONA_PATH` env var in `config.py` so swapping persona is config
+- [x] Create `personas/nemo.md` at repo root
+- [x] Move the system-prompt string from `agent.py:14-39` into it
+- [x] `agent.py` reads `personas/nemo.md` at startup via `config.load_persona()`
+- [x] `PERSONA_PATH` env var in `config.py` so swapping persona is config; missing file raises `FileNotFoundError` with a clear message (no silent fallback to a hardcoded prompt)
 
 ### 3.4 Models directory
-- [ ] Move `custom_wakewords/nemo.onnx` to `models/wake/nemo.onnx`
-- [ ] Update STT config path
-- [ ] Confirm `models/` is gitignored (large binaries don't belong in git)
+- [x] Move `custom_wakewords/nemo.onnx` to `models/wake/nemo.onnx` (plus the `.tflite` sibling)
+- [x] Update STT config path (`openwakeword_model_paths` in `config.make_stt_recorder`)
+- [x] Confirm `models/` is gitignored (was already from Phase 0); removed the now-stale `/custom_wakewords/` entry
 
-**Done when:** `uv run python -c "from robot.agent import Agent; print(Agent)"` works from anywhere in the repo. The flat-files era is over.
+**Done when:** `uv run python -c "from robot.brain import Agent; print(Agent)"` works from anywhere in the repo. The flat-files era is over. ✓
 
 ---
 

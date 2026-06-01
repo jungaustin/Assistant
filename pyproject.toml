@@ -43,7 +43,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
+packages = ["src/robot"]
 
 # pyaudio's PyPI wheel is built with -flat_namespace and fails to find
 # Homebrew's libportaudio at runtime ('_PaMacCore_SetupChannelMap'). Force

@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from config import CAMERA_LOG_PATH, MAX_UTTERANCE_SECONDS, MIC_ENABLED_DEFAULT
+from robot.config import CAMERA_LOG_PATH, MAX_UTTERANCE_SECONDS, MIC_ENABLED_DEFAULT
 
 
 class MicGate:

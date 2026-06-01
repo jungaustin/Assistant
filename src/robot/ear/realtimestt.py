@@ -1,4 +1,4 @@
-from config import make_stt_recorder
+from robot.config import make_stt_recorder
 
 
 class SpeechToText:

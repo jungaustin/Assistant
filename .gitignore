@@ -18,7 +18,6 @@ build/
 *.onnx
 /models/
 /state/
-/custom_wakewords/
 /pyaudio_portaudio/
 
 # IDE
