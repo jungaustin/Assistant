@@ -85,14 +85,23 @@ class Edge:
                 probe.mark_brain_first_token()
                 yield token
 
+        # Collect the full response text so we can print one `assistant: ...`
+        # line after speech finishes — symmetric with the `user: ...` line
+        # above. Helps triage which layer is misbehaving (Whisper mishearing,
+        # LLM drift, TTS mispronunciation) without bag-of-print debugging.
+        spoken_text: list[str] = []
+
         async def pump():
             async for chunk in achunk_tokens(first_token_marker(token_iter)):
+                spoken_text.append(chunk)
                 await asyncio.to_thread(q.put, chunk)
             await asyncio.to_thread(q.put, sentinel)
 
         pump_task = asyncio.create_task(pump())
         await asyncio.to_thread(self.text_to_speech.speak, sync_iter())
         await pump_task
+        if spoken_text:
+            print(f"assistant: {''.join(spoken_text).strip()}")
 
     async def run(self):
         print("listening")

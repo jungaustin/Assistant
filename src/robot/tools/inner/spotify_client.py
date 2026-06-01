@@ -55,7 +55,6 @@ class SpotifyClient:
                 break
 
     def play_song(self, query : str) -> str:
-        print(query)
         if not self.is_token_valid():
             self.refresh_token()
         
@@ -117,18 +116,17 @@ class SpotifyClient:
             if search.status_code != 200:
                 return (f"Error fetching playlists: {search.status_code} - {search.text}")
             for item in items:
-                print(item)
                 my_playlists[item['name']] = item['uri']
             if(len(items) < 50):
                 break
             offset += 50
         self.playlists = my_playlists
-        return self.playlists.keys
+        # Return the actual names (was `self.playlists.keys` — a bound method
+        # whose repr the LLM had to parse, which produced longer/odder turns).
+        return list(self.playlists.keys())
 
     def get_best_playlist_match(self, user_input: str, threshold=70) -> str | None:
-        print("h2")
         result = process.extractOne(user_input, self.playlists.keys(), score_cutoff=threshold)
-        print(result[0] if result else None)
         return result[0] if result else None
     
     def play_playlist(self, input : str) -> str:
@@ -170,9 +168,8 @@ class SpotifyClient:
         if response.status_code == 204:
             return f"Playing '{playlist_name}'."
         else:
-            print(response)
             return f"Failed to play playlist. Status code: {response.status_code}"
-    
+
     def shuffle(self, state : bool) -> str:
         if not self.is_token_valid():
             self.refresh_token()
@@ -188,7 +185,6 @@ class SpotifyClient:
         if response.status_code > 199 and response.status_code < 300:
             return f"It worked."
         else:
-            print(response)
             return f"Failed to shuffle"
     
     def pause_playback(self) -> str:

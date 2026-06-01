@@ -437,30 +437,33 @@ Fill in as we go. The numbers tell us whether we're winning.
 
 | Metric | Before | After Phase 1 (Piper) | After Phase 5 (chunker) | Target |
 |---|---|---|---|---|
-| First-audio latency | _measure_ | 1331ms total (stt→token 1249ms, token→audio 82ms) | _pending real voice loop_ | <500ms |
-| End-to-end response time | _measure_ | | | <2s perceived |
-| `requirements.txt` line count | ~40 | _file deleted in Phase 3_ | | n/a |
+| First-audio latency (token→audio) | _measure_ | 82ms (short response) | **73–195ms** across 3 real-mic turns (see breakdown) | <500ms ✓ |
+| Total turn (stt→audio) | _measure_ | 1331ms | **1211–3527ms**; cloud LLM (`stt→token`) dominates | <2s perceived |
+| `requirements.txt` line count | ~40 | _file deleted in Phase 3_ | n/a | n/a |
 | Direct `langchain*` deps | 3 | 2 after Phase 2.3 (`langchain` + `langchain-core`) | 2 | 0 (deferred — Phase 4 indefinitely) |
 | Total deps in `uv.lock` | _measure_ | dropped `langchain-openai`, `regex`, `tiktoken` in Phase 2.3 | added `pytest`, `pytest-asyncio`, `iniconfig`, `pluggy` (dev only) | meaningfully smaller |
 
-**Phase 5 chunker measurement is pending a real voice-loop turn.** The chunker
-moves token-buffering OUT of the engines and INTO a single upstream stage. Two
-mechanisms determine the win:
+### Real-mic measurement (2026-06-01)
 
-1. **Earlier first-phrase delivery** for multi-boundary tokens. Some local
-   models emit whole sentences in one streaming delta (`"Hello. How are
-   you?"` as a single token). The old per-engine logic buffered the whole
-   token until the next delta arrived; the chunker splits inside the token
-   and emits the first phrase immediately.
-2. **Force-flush at 80 chars** for runs without natural punctuation. The old
-   PiperEngine had no length cap; a long run with no `. ! ? \n` would
-   buffer until end-of-stream. Chunker emits at 80 chars at the last
-   whitespace.
+After the chunker + PiperEngine buffer removal, three back-to-back turns on the
+M1 + OpenAI gpt-4o-mini + Piper en_US-amy-medium pipeline:
 
-To measure: run `just run`, say "nemo, hello" (short response — measures
-case 1) and "nemo, tell me a long story" (longer response — measures case
-2). The latency probe prints `total / stt→token / token→audio` per turn.
-Record token→audio here.
+| Turn | Response shape | total | stt→token | token→audio |
+|---|---|---|---|---|
+| "What is 1 plus 1?" | very short (~1-3 words) | 1342ms | 1269ms | **73ms** |
+| "Tell me about whales..." | medium prose | 1211ms | 1058ms | **152ms** |
+| "Shuffle my Smoothie playlist" | tool call → re-stream | 3527ms | 3332ms | **195ms** |
+
+Read:
+- token→audio comfortably under 500ms target on all three. Turn 1 (73ms) beats
+  the Phase 1 baseline of 82ms — the chunker + un-buffered Piper is a net win.
+- Total turn is dominated by `stt→token` (cloud LLM). The Spotify turn doubles
+  it because tool calls force two LLM round-trips (decide → tool result →
+  final response). Local LLM (Phase 8 / M5 Mini) is what brings totals under
+  the 2s target.
+- The chunker's win mechanisms (multi-boundary single tokens, 80-char
+  force-flush) are both engaged in the longer-response turns; the short turn
+  doesn't exercise them (whole response fits in one chunk).
 
 ---
 
