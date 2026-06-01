@@ -29,6 +29,31 @@ MAX_UTTERANCE_SECONDS = int(os.getenv("MAX_UTTERANCE_SECONDS", "30"))
 CAMERA_LOG_PATH = os.getenv("CAMERA_LOG_PATH", "camera_access.log")
 FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
 
+# Conversation state. SqliteSaver writes here so the process survives
+# restart with its conversation memory intact. Directory is created on
+# first use; the file is git-ignored (state/ in .gitignore).
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", "state/conversations.db")
+
+
+def daily_thread_id() -> str:
+    """Today's local date as an ISO string — the default `thread_id` policy.
+
+    Local time, not UTC: a desk robot's "today" should match wall-clock.
+    Otherwise UTC midnight could wipe your morning conversation mid-afternoon
+    depending on your timezone.
+
+    Why per-day: matches how humans remember small daily interactions.
+    Within a day, follow-up turns and mid-afternoon callbacks work
+    naturally. Across days, conversations reset — cleaner mental model
+    than "this thread spans a week because you forgot to start a new one".
+    Cross-day search is the job of recall(), landing in Phase 6b.
+
+    Tests and one-off scripts can override with `Agent(thread_id=...)`.
+    """
+    from datetime import date
+
+    return date.today().isoformat()
+
 # Persona system prompt. Swap the file (or PERSONA_PATH) to give the agent a
 # different personality without touching code.
 PERSONA_PATH = os.getenv("PERSONA_PATH", "personas/nemo.md")
