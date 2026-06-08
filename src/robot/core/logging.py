@@ -88,6 +88,17 @@ def configure_logging(level: str | None = None) -> None:
     root.handlers = [handler]
     root.setLevel(log_level)
 
+    # Third-party loggers that spam at INFO level. Each is pinned to
+    # WARNING so their INFO chatter doesn't flood the terminal during
+    # recording. Comment any line out below to see that library's
+    # messages again (useful when debugging that specific layer).
+    logging.getLogger("faster_whisper").setLevel(logging.WARNING)  # every audio chunk
+    logging.getLogger("httpx").setLevel(logging.WARNING)           # every HTTP call
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """Convenience wrapper. Prefer this in new code over
