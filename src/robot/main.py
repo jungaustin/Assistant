@@ -7,11 +7,14 @@ import asyncio
 
 from robot.brain import Agent
 from robot.config import FOLLOWUP_WINDOW_SECONDS
+from robot.core.logging import configure_logging, get_logger
 from robot.latency import probe
 from robot.privacy import MicGate
 from robot.ear import SpeechToText
 from robot.transport import InProcessTransport
 from robot.voice import TextToSpeech
+
+log = get_logger(__name__)
 
 
 class Edge:
@@ -104,21 +107,29 @@ class Edge:
             print(f"assistant: {''.join(spoken_text).strip()}")
 
     async def run(self):
-        print("listening")
+        log.info("edge_state", state="listening")
         while True:
             utterance = await self._listen_once()
             if not utterance:
                 continue
             while utterance:
+                # Conversation transcripts stay as plain prints — they're
+                # for watching the robot live, and structlog metadata
+                # (timestamp, level, logger name) would just be noise.
+                # Pipe stdout to a file and switch to JSON mode for logs.
                 print(f"user: {utterance}")
                 tokens = self.transport.respond(utterance)
                 await self._speak_stream(tokens)
-                print(f"follow-up window ({FOLLOWUP_WINDOW_SECONDS:.0f}s)")
+                log.info(
+                    "edge_state", state="follow_up", seconds=FOLLOWUP_WINDOW_SECONDS
+                )
                 utterance = await self._listen_followup(FOLLOWUP_WINDOW_SECONDS)
-            print("listening")
+            log.info("edge_state", state="listening")
 
 
 async def amain():
+    configure_logging()
+    log.info("edge_starting")
     brain = Agent()
     transport = InProcessTransport(brain)
     edge = Edge(transport)

@@ -34,6 +34,12 @@ FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
 # first use; the file is git-ignored (state/ in .gitignore).
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "state/conversations.db")
 
+# Durable episodic memory (the MVM episodic log — see memory-architecture.md).
+# Separate file from STATE_DB_PATH on purpose: the checkpointer's connection is
+# driven by LangGraph's threadpool, and episodic writes shouldn't contend with
+# it. `recall(query)` searches this store.
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "state/memory.db")
+
 
 def daily_thread_id() -> str:
     """Today's local date as an ISO string — the default `thread_id` policy.

@@ -28,6 +28,19 @@ class MicGate:
 
     @property
     def enabled(self) -> bool:
+        """Effective mic state: software-on AND not hardware-muted.
+
+        Callers check this to ask 'are we allowed to listen right now?'.
+        Hardware mute always wins — a physical button cutting mic power can't
+        be overridden in software. `software_enabled` exposes the raw flag.
+        """
+        with self._lock:
+            software = self._enabled
+        return software and not self.hardware_muted()
+
+    @property
+    def software_enabled(self) -> bool:
+        """The raw software flag, ignoring any hardware mute."""
         with self._lock:
             return self._enabled
 
@@ -39,6 +52,37 @@ class MicGate:
         with self._lock:
             self._enabled = not self._enabled
             return self._enabled
+
+    def set_hardware_mute_pin(self, pin_reader) -> None:
+        """Register a hardware mute source (Phase 8 / Pi).
+
+        Placeholder for the physical mute button on the desk-robot shopping
+        list (desk-robot-plan.md §5 — 'required for v1'). On the Pi, the
+        button cuts mic power at the hardware level; this hook lets the
+        software gate *also* observe that state so the LED/UX can reflect it.
+
+        `pin_reader` is any zero-arg callable returning True when the mic is
+        hardware-muted. Until the Pi exists this is a no-op store — the
+        software gate alone governs the mic on the laptop.
+        """
+        self._hardware_mute_pin = pin_reader
+
+    def hardware_muted(self) -> bool:
+        """True if a registered hardware mute source reports muted.
+
+        Defaults to False (no hardware mute wired yet). The effective mic
+        state is `enabled and not hardware_muted()` — hardware always wins,
+        matching the physical button cutting mic power at the source.
+        """
+        reader = getattr(self, "_hardware_mute_pin", None)
+        if reader is None:
+            return False
+        try:
+            return bool(reader())
+        except Exception:
+            # A flaky pin reader must fail safe: treat as muted, never as
+            # silently-live. Privacy default is "off when uncertain".
+            return True
 
 
 _camera_logger: logging.Logger | None = None

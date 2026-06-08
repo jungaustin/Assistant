@@ -28,6 +28,7 @@ dependencies = [
     "requests",
     "rich",
     "sounddevice>=0.4",
+    "structlog>=25.5.0",
 ]
 
 [project.optional-dependencies]
