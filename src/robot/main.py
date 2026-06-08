@@ -48,9 +48,12 @@ class Edge:
                 text = await asyncio.wait_for(listen_task, timeout=timeout)
             except asyncio.TimeoutError:
                 self.speech_to_text.abort()
+                # CancelledError doesn't inherit from Exception in 3.8+;
+                # catch both so the abort path doesn't propagate when the
+                # listen task is cancelled by the timeout above.
                 try:
                     await listen_task
-                except Exception:
+                except (Exception, asyncio.CancelledError):
                     pass
                 return None
         finally:
