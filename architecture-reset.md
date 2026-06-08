@@ -282,26 +282,43 @@ Defer until 3+ components race for control (Conductor) or until Phase 8 actually
 **Goal:** Survive restart. Survive Wi-Fi blips. Tell the operator what's happening.
 
 ### 6.1 SqliteSaver memory
-- [ ] Replace `MemorySaver` in `agent.py` with `SqliteSaver` pointed at `state/conversations.db`
-- [ ] `state/` is gitignored
-- [ ] Decide on `thread_id` policy: per-day, per-wake-event, or per-explicit-session — document in this file
-- [ ] Add `forget_session` and `recall(query)` tools so cross-session memory is reachable from the agent
+
+> **Design pointer:** the cross-session memory work (`recall(query)`, the
+> episodic/semantic/preference split, the classifier gate) is specified in
+> [`memory-architecture.md`](memory-architecture.md). That doc is the **v2**
+> north star; build the "Minimum Viable Memory" section there (3 SQLite
+> tables) behind these stubs — don't build the full graph before September 1.
+
+- [x] Replace `MemorySaver` in `agent.py` with `SqliteSaver` pointed at `state/conversations.db`
+- [x] `state/` is gitignored
+- [x] Decide on `thread_id` policy: per-day (today's local date). Documented in `config.daily_thread_id` — within a day turns chain, conversations reset overnight.
+- [x] Add `forget_session` and `recall(query)` tools so cross-session memory is reachable from the agent
+  - `forget_session` wipes the current thread's checkpoints.
+  - `recall(query)` searches the durable **episodic log** (`memory/store.py`, `MemoryStore` → `state/memory.db`) — the MVM from `memory-architecture.md`. Keyword + recency, no embeddings yet (deliberate; add when it misses). Turns are written episodically by `Agent.stream()` on completion (Brain-side, after the last token, so zero perceived latency). Tested in `tests/test_memory_store.py`.
 
 ### 6.2 Privacy gate, hardened
-- [ ] Move `MicGate` into `privacy/gate.py` if not already
-- [ ] All audio reads from `Ear` go through the gate — gate-closed = silent no-op, no buffering
-- [ ] Hard cap of `MAX_UTTERANCE_SECONDS` enforced on Ear's side, not just trusted from the recorder
-- [ ] Toggle hook for a future hardware mute pin (placeholder function)
-- [ ] Camera access log already exists — confirm every code path that opens the camera calls `log_camera_access()`
+- [x] Move `MicGate` into `privacy/gate.py` if not already
+- [x] All audio reads from `Ear` go through the gate — `main.Edge._listen_once`/`_listen_followup` short-circuit when `mic_gate.enabled` is False (no buffering)
+- [ ] **Hard cap of `MAX_UTTERANCE_SECONDS` enforced on Ear's side, not just trusted from the recorder** — deferred: needs real-mic validation. The `text()` call bundles wake-wait (should be unbounded) with utterance-record (should be capped); separating them cleanly requires recorder hooks I can't verify without the mic + Pi. `mic_gate.max_seconds` + `utterance_cap_reached()` helper exist; wiring them without breaking the wake loop is a hardware-bench task (folds naturally into Phase 8).
+- [x] Toggle hook for a future hardware mute pin (placeholder function) — `MicGate.set_hardware_mute_pin()` / `hardware_muted()`. `enabled` is now the *effective* gate (software AND not hardware-muted); hardware always wins; flaky pin reader fails safe to muted. Tested in `tests/test_privacy_gate.py`.
+- [x] Camera access log already exists — `log_camera_access()` in `privacy/gate.py`. (No camera capture path wired yet — that's Phase 3 of desk-robot-plan; the logger is ready for it.)
 
 ### 6.3 Structured logging
-- [ ] Add `loguru` (simple) or `structlog` (structured JSON)
-- [ ] Replace every `print()` in `src/robot/` with a logger call
-- [ ] Set log level via env var (`LOG_LEVEL=INFO`)
-- [ ] Verify log output is grep-friendly
+- [x] Add `loguru` (simple) or `structlog` (structured JSON) — `structlog` (`core/logging.py`), auto JSON-when-piped / pretty-when-TTY
+- [x] Replace every `print()` in `src/robot/` with a logger call — done *except* the two intentional conversation transcripts in `main.py` (`user:` / `assistant:` lines) and the `latency.py` probe print, which are deliberately plain stdout (live-watching the robot, not log records — see the comment in `main.run`)
+- [x] Set log level via env var (`LOG_LEVEL=INFO`)
+- [x] Verify log output is grep-friendly (JSONRenderer when not a TTY)
 
 ### 6.4 Health checks (Heartbeat publishing moved to Phase 5.4 — Office Hours, 2026-05-10)
-- [ ] Watchdog task in `main.py` subscribes to `Heartbeat` events from the bus; logs a warning if any component goes silent for >N seconds. (No formal Conductor yet — simple async task is enough.)
+
+> **Deferred into Phase 8 (intentional).** A watchdog has nothing to watch
+> until components actually publish `Heartbeat` events onto the bus — and per
+> the cut-down Phase 5 plan, components only move onto the bus when Phase 8's
+> network boundary needs them to. Building the watchdog now would be a task
+> subscribing to an empty topic. It lands with the WebSocket reconnect work,
+> where a silent component is a real signal.
+
+- [ ] Watchdog task in `main.py` subscribes to `Heartbeat` events from the bus; logs a warning if any component goes silent for >N seconds. (No formal Conductor yet — simple async task is enough.) *(blocked on Phase 8 bus migration)*
 - [ ] Lays groundwork for Phase 8's WebSocket reconnect logic.
 
 <details>
