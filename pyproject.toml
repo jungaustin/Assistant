@@ -13,6 +13,9 @@ authors = [{ name = "Austin Jung", email = "jungaustin@gmail.com" }]
 dependencies = [
     "aiofiles",
     "aiohttp",
+    "google-api-python-client>=2.197.0",
+    "google-auth-httplib2>=0.4.0",
+    "google-auth-oauthlib>=1.4.0",
     "langchain>=0.0.332",
     "langchain-core",
     "langgraph",
@@ -26,9 +29,12 @@ dependencies = [
     "rapidfuzz",
     "RealtimeSTT",
     "requests",
+    "tavily-python>=0.5.0",
     "rich",
     "sounddevice>=0.4",
     "structlog>=25.5.0",
+    "pyobjc-framework-quartz>=12.2.1",
+    "websockets>=15",
 ]
 
 [project.optional-dependencies]

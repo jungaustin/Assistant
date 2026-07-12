@@ -80,7 +80,9 @@ Every other Phase 7 idea — calendar, weather, smart home, multi-room, voice ID
 
 The order matters. Each phase produces a working artifact you can use, and de-risks the next phase. **Don't buy hardware until Phase 3 is done.**
 
-### Phase 0 — Local LLM running on the Mac (1 evening)
+### Phase 0 — Local LLM running on the Mac (1 evening) — ✅ DONE 2026-06-12
+
+> Ollama 0.30.8 running qwen2.5:32b (and 14b pulled for comparison). OpenAI-compatible endpoint verified. `just run` starts/stops the server and pre-warms the model. ~19GB resident for 32b on the M1 Max / 64GB.
 
 **Goal:** Confirm Ollama works, the chosen model loads, and you can chat with it.
 
@@ -94,7 +96,9 @@ The order matters. Each phase produces a working artifact you can use, and de-ri
 
 ---
 
-### Phase 1 — Wire existing music agent to the local model (1-2 evenings)
+### Phase 1 — Wire existing music agent to the local model (1-2 evenings) — ✅ DONE 2026-06-12
+
+> Brain swapped from `gpt-4o-mini` to local qwen2.5:32b via env vars only (`BRAIN_BASE_URL`/`LLM_MODEL`), no code change. Tool calling verified reliable across all 22 tools — cleared the plan's #1 risk. Root-caused the early 20s latency to Ollama's default 2048-token context overflowing the tool schemas; fixed with `OLLAMA_CONTEXT_LENGTH` (now 16384). 14b was faster but leaked multilingual gibberish, so 32b is the daily driver.
 
 **Goal:** Prove that local-model tool calling is reliable enough for this project. This is the most important early signal.
 
@@ -110,7 +114,9 @@ The order matters. Each phase produces a working artifact you can use, and de-ri
 
 ---
 
-### Phase 2 — Voice loop on the laptop (2-3 evenings)
+### Phase 2 — Voice loop on the laptop (2-3 evenings) — ✅ DONE
+
+> Full hands-free loop in `main.py`: openWakeWord ("nemo") → RealtimeSTT (`small.en`) → local brain → Piper TTS, with a follow-up window so you don't re-say the wake word, a MicGate privacy switch, and a boot "ready" beep. This is the current daily-run state via `just run`.
 
 **Goal:** Make the agent fully voice-controlled, running entirely on the laptop. The "robot" at this stage is just the laptop with a mic and speakers — you're proving the conversation loop works end-to-end before introducing hardware.
 
@@ -124,7 +130,9 @@ Components:
 
 ---
 
-### Phase 3 — Vision capability (1-2 evenings)
+### Phase 3 — Vision capability (1-2 evenings) — ⏸️ DEFERRED 2026-06-12
+
+> Deprioritized by user in favor of Tier 1/2 tools first. Not started. Pick back up after the agentic-tools backlog or alongside the Phase 8 hardware work.
 
 **Goal:** Add a "look at the world" tool the agent can call.
 
@@ -295,7 +303,37 @@ That's the only experiment that actually tells you whether the rest of the plan 
 
 ---
 
-## 9. Future / "wouldn't it be cool if" ideas
+## 9. Agentic Tools Backlog
+
+Tools to build, roughly in priority order. All are Phase 7 scope unless noted.
+
+### Tier 1 — High daily use, easy to ship
+
+| Tool | How | Notes |
+|---|---|---|
+| **Timer** | `threading.Timer` + beep callback | ✅ Built 2026-06-12. Background timers (keep talking while one runs), set/list/cancel, double-blip on done. No API. |
+| **Weather** | ~~`wttr.in`~~ | ⏭️ Skipped 2026-06-12 — the Tavily `web_search` tool answers weather cleanly, so a dedicated tool is redundant. |
+| **Web search** | Tavily API | ✅ Built 2026-06-12. Answer-synthesis mode (one spoken paragraph, not raw links). Lazy client; missing key degrades gracefully. |
+
+### Tier 2 — High value, slightly more work
+
+| Tool | How | Notes |
+|---|---|---|
+| **Discord** | Bot token, REST only | ✅ Built 2026-06-12. Send + catch-up (summarize since last read). Nemo keeps its own per-channel cursor (Discord hides personal read state from bots); `since` override + mark-as-read handle cursor staleness. Awaiting bot creation in the Developer Portal. |
+| **Nightly check-in prompt** | Scheduled task at ~22:00 | ✅ Built 2026-06-12 in `core/checkin.py`, wired into `main.py`. Background asyncio task; at `DAILY_LOG_PROMPT_HOUR` asks about unlogged `DAILY_REQUIRED_TYPES`, silent if complete. Nemo's first proactive behavior. |
+
+### Tier 3 — Useful but defer
+
+| Tool | Why defer |
+|---|---|
+| Smart home (HomeKit/Home Assistant) | Only worth it once the physical robot is on the desk |
+| Clipboard read/write | Niche; typing is faster |
+| Screen reader / OCR | Phase 3 vision tool covers most of this |
+| Reminders beyond calendar | `log_entry` + `add_calendar_event` already cover the use case |
+
+---
+
+## 10. Future / "wouldn't it be cool if" ideas
 
 - Recognize you specifically vs. other people via voice ID.
 - Proactive behavior: "you've been at the desk for 4 hours, want a break?"

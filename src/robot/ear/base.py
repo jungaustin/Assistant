@@ -15,6 +15,10 @@ class Ear(Protocol):
     def listen(self) -> Optional[str]:
         """Block until an utterance is captured. Return None on timeout/abort."""
 
+    @property
+    def is_recording(self) -> bool:
+        """True while actively capturing speech (vs waiting to start)."""
+
     def set_wake_word_bypass(self, timeout: float) -> None:
         """Skip the wake word for the next listen() within `timeout` seconds."""
 

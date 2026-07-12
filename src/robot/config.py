@@ -23,11 +23,75 @@ PIPER_VOICE_PATH = os.getenv(
 
 STT_PROVIDER = os.getenv("STT_PROVIDER", "realtimestt").lower()
 STT_MODEL = os.getenv("STT_MODEL", "small.en")
+# End-of-utterance tuning. post_speech_silence_duration is how long the
+# recorder waits in silence before deciding you've finished talking;
+# RealtimeSTT's 0.6s default cuts people off on a normal mid-sentence pause,
+# so 1.3s leaves room to breathe. webrtc_sensitivity is VAD aggressiveness
+# 0–3 (higher = more eager to call speech "silence"); 2 is gentler than the
+# library default of 3, which helps with quiet or trailing-off speech.
+STT_END_SILENCE_SECONDS = float(os.getenv("STT_END_SILENCE_SECONDS", "1.3"))
+STT_WEBRTC_SENSITIVITY = int(os.getenv("STT_WEBRTC_SENSITIVITY", "2"))
+# Use Silero (a neural VAD) instead of WebRTC alone to decide when speech has
+# *ended*. WebRTC at a gentle sensitivity gets fooled by breath/room tone and
+# sometimes never registers the silence, so the recorder keeps capturing after
+# you've finished. Silero is far better at speech-vs-not, which is what end-of-
+# turn detection actually needs. The Silero model is already loaded today (it's
+# used for start-of-speech), so this only changes which detector ends the turn.
+STT_SILERO_DEACTIVITY = os.getenv("STT_SILERO_DEACTIVITY", "true").lower() == "true"
+# Load the ONNX build of Silero rather than the torch one. Off by default to
+# match the existing load path exactly; flip on for a lighter CPU footprint.
+STT_SILERO_USE_ONNX = os.getenv("STT_SILERO_USE_ONNX", "false").lower() == "true"
 
 MIC_ENABLED_DEFAULT = os.getenv("MIC_ENABLED", "true").lower() == "true"
 MAX_UTTERANCE_SECONDS = int(os.getenv("MAX_UTTERANCE_SECONDS", "30"))
 CAMERA_LOG_PATH = os.getenv("CAMERA_LOG_PATH", "camera_access.log")
-FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "20"))
+FOLLOWUP_WINDOW_SECONDS = float(os.getenv("FOLLOWUP_WINDOW_SECONDS", "8"))
+# Quiet gap inserted after Nemo finishes speaking before the follow-up window
+# opens. Lets the speaker's audio tail / room echo die down so the mic doesn't
+# capture Nemo's own voice and feed it back as a "user" turn (the self-talk
+# loop). Small on purpose — it's dead air the user waits through.
+FOLLOWUP_POST_SPEECH_DELAY = float(os.getenv("FOLLOWUP_POST_SPEECH_DELAY", "0.4"))
+# How similar a follow-up transcript must be to what Nemo just said before we
+# treat it as an echo of our own speech and discard it instead of answering.
+# Only applied to utterances that already span most of the spoken reply (see
+# _is_echo_or_junk), so it targets near-whole echoes, not short new commands.
+# Set above 1.0 to disable fuzzy echo matching entirely (verbatim/substring
+# echoes are still caught).
+ECHO_SIMILARITY_THRESHOLD = float(os.getenv("ECHO_SIMILARITY_THRESHOLD", "0.9"))
+# How often the listen() watchdog polls recorder health. RealtimeSTT's capture
+# loop runs in a daemon thread; if it dies, listen() blocks forever. The
+# watchdog notices the dead thread and rebuilds the recorder. Also the fast-path
+# poll interval, so keep it small (a completed listen returns immediately, not
+# after this delay).
+STT_HEALTH_POLL_SECONDS = float(os.getenv("STT_HEALTH_POLL_SECONDS", "0.5"))
+# How often, while a wake-word listen is still blocked, to emit a heartbeat log
+# line. Turns an indefinite wait into something visible: regular heartbeats mean
+# "alive, waiting for the wake word"; heartbeats that stop (or flip to
+# healthy=False) mean the recorder wedged. Set high enough not to spam an idle
+# robot's logs.
+STT_LISTEN_HEARTBEAT_SECONDS = float(os.getenv("STT_LISTEN_HEARTBEAT_SECONDS", "30"))
+
+# Transport seam (Phase 8 Pi/Mac split). "inproc" runs Brain and Edge in one
+# process — today's default. "websocket" makes `python -m robot.main` run
+# Edge-only and connect to a brain server (`python -m robot.brain_server`).
+TRANSPORT = os.getenv("TRANSPORT", "inproc").lower()
+# Client side: where the Edge finds the brain server.
+BRAIN_WS_URL = os.getenv("BRAIN_WS_URL", "ws://localhost:8765")
+# Server side: bind address. localhost by default (loopback smoke test);
+# set 0.0.0.0 in .env when the Pi needs to reach it over the LAN.
+BRAIN_WS_HOST = os.getenv("BRAIN_WS_HOST", "localhost")
+BRAIN_WS_PORT = int(os.getenv("BRAIN_WS_PORT", "8765"))
+# Shared secret both sides must present/verify. Required whenever
+# TRANSPORT=websocket — the server refuses to start without it, so an open
+# LAN port can never expose an unauthenticated brain.
+TRANSPORT_TOKEN = os.getenv("TRANSPORT_TOKEN", "")
+
+# How many recent messages to send to the LLM per call. The full conversation
+# is still checkpointed and searchable via recall(); this only bounds the
+# per-call prompt so latency doesn't grow as the day's thread accumulates
+# (a tool turn = two LLM round-trips over the whole history). Keep comfortably
+# above one turn's worth of tool messages so a single turn is never cut.
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 
 # Conversation state. SqliteSaver writes here so the process survives
 # restart with its conversation memory intact. Directory is created on
@@ -39,6 +103,43 @@ STATE_DB_PATH = os.getenv("STATE_DB_PATH", "state/conversations.db")
 # driven by LangGraph's threadpool, and episodic writes shouldn't contend with
 # it. `recall(query)` searches this store.
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "state/memory.db")
+
+# Personal data tracker (calories, exercise, sleep, mood, period notes).
+TRACKER_DB_PATH = os.getenv("TRACKER_DB_PATH", "state/tracker.db")
+
+# Nightly check-in (proactive, see core/checkin.py). At this local hour,
+# Nemo asks about any required types not yet logged today. Disable with
+# hour=-1 or an empty types list.
+DAILY_LOG_PROMPT_HOUR = int(os.getenv("DAILY_LOG_PROMPT_HOUR", "22"))
+DAILY_REQUIRED_TYPES = [
+    t.strip().lower()
+    for t in os.getenv("DAILY_REQUIRED_TYPES", "calories,exercise,sleep").split(",")
+    if t.strip()
+]
+
+# Tavily web search API key. Get one at https://tavily.com.
+# Used by the web_search tool for voice-optimized answer synthesis.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+# Discord bot token (send + catch-up tools). Created at
+# https://discord.com/developers/applications — see .env.example for the
+# one-time setup steps. Tools degrade gracefully when unset.
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+# Per-channel "last message Nemo summarized" markers. Discord doesn't share
+# your personal read state with bots, so Nemo tracks its own.
+DISCORD_CURSOR_PATH = os.getenv("DISCORD_CURSOR_PATH", "state/discord_cursors.json")
+
+# Google Calendar. credentials.json is downloaded once from the Google
+# Cloud Console (Desktop app OAuth client). The token file is written by
+# the OAuth bootstrap and refreshed automatically on use. Both live in
+# state/ so they're gitignored.
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+GOOGLE_CALENDAR_CREDENTIALS_PATH = os.getenv(
+    "GOOGLE_CALENDAR_CREDENTIALS_PATH", "state/google-credentials.json"
+)
+GOOGLE_CALENDAR_TOKEN_PATH = os.getenv(
+    "GOOGLE_CALENDAR_TOKEN_PATH", "state/google-calendar-token.json"
+)
 
 
 def daily_thread_id() -> str:
@@ -59,6 +160,7 @@ def daily_thread_id() -> str:
     from datetime import date
 
     return date.today().isoformat()
+
 
 # Persona system prompt. Swap the file (or PERSONA_PATH) to give the agent a
 # different personality without touching code.
@@ -86,6 +188,7 @@ def make_llm():
     """Build the chat LLM. No silent default to cloud — provider is explicit."""
     if LLM_PROVIDER == "openai-compat":
         from robot.brain.openai_compat import OpenAICompatChat
+
         return OpenAICompatChat(
             model=LLM_MODEL,
             base_url=BRAIN_BASE_URL,
@@ -93,6 +196,7 @@ def make_llm():
         )
     if LLM_PROVIDER == "ollama":
         from langchain_ollama import ChatOllama
+
         return ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
     raise ValueError(
         f"Unknown LLM_PROVIDER={LLM_PROVIDER!r}. "
@@ -104,12 +208,15 @@ def make_tts_engine():
     """Build the TTS engine. Returns a RealtimeTTS engine instance."""
     if TTS_PROVIDER == "openai":
         from RealtimeTTS import OpenAIEngine
+
         return OpenAIEngine(voice=TTS_VOICE) if TTS_VOICE else OpenAIEngine()
     if TTS_PROVIDER == "coqui":
         from RealtimeTTS import CoquiEngine
+
         return CoquiEngine()
     if TTS_PROVIDER == "piper":
         from robot.voice.engines.piper_engine import PiperEngine
+
         return PiperEngine(voice_path=PIPER_VOICE_PATH)
     raise ValueError(
         f"Unknown TTS_PROVIDER={TTS_PROVIDER!r}. "
@@ -121,11 +228,29 @@ def make_stt_recorder():
     """Build the STT recorder. Returns an object with a .text() method."""
     if STT_PROVIDER == "realtimestt":
         from RealtimeSTT import AudioToTextRecorder
+
+        from robot.voice.beep import wake_beep
+
         return AudioToTextRecorder(
             model=STT_MODEL,
+            # No terminal spinner: it's redundant with the beeps/logs, and
+            # RealtimeSTT's abort() sets state to "transcribing" even when
+            # nothing was captured, so the spinner printed a misleading
+            # "transcribing" every time the deafen key aborted a listen.
+            spinner=False,
             enable_realtime_transcription=True,
             realtime_processing_pause=0.1,
+            post_speech_silence_duration=STT_END_SILENCE_SECONDS,
+            webrtc_sensitivity=STT_WEBRTC_SENSITIVITY,
+            silero_deactivity_detection=STT_SILERO_DEACTIVITY,
+            silero_use_onnx=STT_SILERO_USE_ONNX,
             wake_words="nemo",
+            # Same cue as the push-to-talk key: "I heard you, talk now."
+            # Beeps are fire-and-forget on their own thread/stream, so this
+            # can't stall the capture thread or clip the start of speech.
+            # Doesn't fire on force_start() (the hotkey beeps itself) or
+            # during a follow-up window's wake-word bypass.
+            on_wakeword_detected=wake_beep,
             wakeword_backend="oww",
             openwakeword_model_paths="models/wake/nemo.onnx",
             openwakeword_inference_framework="onnx",

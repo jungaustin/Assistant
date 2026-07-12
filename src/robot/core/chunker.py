@@ -23,9 +23,32 @@ beat, which is fine and arguably correct prosody.
 
 from __future__ import annotations
 
+import re
 from typing import AsyncIterator, Iterable, Iterator
 
 MAX_CHARS = 80
+
+# Markdown emphasis/code markers the LLM emits even when told not to. A TTS
+# engine reads these aloud ("asterisk", "backtick") or stumbles on them, so we
+# delete them from the audio path. Applied per-chunk, which is safe because we
+# strip runs of the character regardless of pairing — a `**bold**` split across
+# two chunks still loses its asterisks on both sides. Slashes/underscores are
+# deliberately NOT stripped here (they carry meaning in "24/7", dates, math);
+# the persona prompt handles those where judgment is needed.
+_SPEECH_NOISE = re.compile(r"[*`]+")
+_DOUBLE_SPACE = re.compile(r"  +")
+
+
+def sanitize_for_speech(text: str) -> str:
+    """Strip spoken-markup noise (``*``, ``` ` ```) from a chunk bound for TTS.
+
+    Cheap enough to run on every chunk in the streaming path — a regex sub on
+    an ~80-char string — so it never delays audio. Collapses the double space a
+    removed inline marker can leave (``foo **bar**`` mid-word markers don't, but
+    `` ** `` as a standalone token would).
+    """
+    text = _SPEECH_NOISE.sub("", text)
+    return _DOUBLE_SPACE.sub(" ", text)
 HARD_BOUNDARIES = (". ", "! ", "? ", "\n")
 SOFT_BOUNDARIES = (", ",)
 ALL_BOUNDARIES = HARD_BOUNDARIES + SOFT_BOUNDARIES

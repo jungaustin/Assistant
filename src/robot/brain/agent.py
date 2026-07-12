@@ -7,16 +7,21 @@ from __future__ import annotations
 import atexit
 import logging
 import sqlite3
+import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
+from uuid import UUID
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from robot.config import (
+    MAX_HISTORY_MESSAGES,
     MEMORY_DB_PATH,
     STATE_DB_PATH,
     daily_thread_id,
@@ -27,6 +32,108 @@ from robot.memory import MemoryStore
 from robot.tools.manager import ToolManager
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(value, limit: int = 200) -> str:
+    """Render a value to a single short string for a log line.
+
+    Tool args/results can be large (web search hits, playlist dumps); cap them
+    so the log stays scannable while still showing what was passed.
+    """
+    s = str(value).replace("\n", " ")
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… (+{len(s) - limit} chars)"
+
+
+def _trim_history(messages: list, max_messages: int) -> list:
+    """Bound what the LLM sees to roughly the last `max_messages`.
+
+    A tool turn costs two LLM round-trips over the *entire* thread, and the
+    daily thread only grows, so latency climbs through the day. Trimming the
+    per-call prompt fixes that. The full history is still checkpointed and
+    older context stays reachable via recall() — this only shrinks the window
+    sent to the model.
+
+    `start_on="human"` keeps the window from beginning mid tool-exchange
+    (OpenAI 400s on a tool result whose tool_call was trimmed away). If the
+    last `max_messages` don't reach back to a user turn — a single turn with
+    more tool rounds than the window — that guard would return nothing, so we
+    fall back to everything since the most recent user message.
+    """
+    trimmed = trim_messages(
+        messages,
+        strategy="last",
+        token_counter=len,  # count messages, not tokens
+        max_tokens=max_messages,
+        start_on="human",
+        include_system=False,
+    )
+    if trimmed or not messages:
+        return trimmed
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            return messages[i:]
+    return messages
+
+
+class ToolCallLogger(BaseCallbackHandler):
+    """Logs every tool call's start, finish (with duration), and errors.
+
+    Wired into the agent's run config so each ToolNode invocation emits a
+    line. The point is "where did it get stuck": a ``tool start`` with no
+    matching ``tool done`` is the call that hung. Pair this with the
+    ``llm start``/``llm done`` lines from the assistant node to tell a stuck
+    model round-trip apart from a stuck tool.
+
+    Keyed by run_id so concurrent tool calls (ToolNode can fan out) don't
+    clobber each other's timers.
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict[UUID, tuple[str, float]] = {}
+
+    def on_tool_start(self, serialized, input_str, *, run_id, inputs=None, **kwargs):
+        name = kwargs.get("name") or (serialized or {}).get("name") or "tool"
+        self._starts[run_id] = (name, time.monotonic())
+        args = inputs if inputs is not None else input_str
+        logger.info("tool start name=%s args=%s", name, _truncate(args))
+
+    def on_tool_end(self, output, *, run_id, **kwargs):
+        name, t0 = self._starts.pop(run_id, ("tool", time.monotonic()))
+        logger.info(
+            "tool done  name=%s elapsed=%.2fs result=%s",
+            name,
+            time.monotonic() - t0,
+            _truncate(output),
+        )
+
+    def on_tool_error(self, error, *, run_id, **kwargs):
+        name, t0 = self._starts.pop(run_id, ("tool", time.monotonic()))
+        logger.warning(
+            "tool error name=%s elapsed=%.2fs error=%s: %s",
+            name,
+            time.monotonic() - t0,
+            error.__class__.__name__,
+            error,
+        )
+
+
+def build_datetime_context() -> str:
+    """Return a ~25-token datetime block for injection into the system prompt.
+
+    Gives Nemo: current date, this week's Monday (for period_start on week notes),
+    and this month's first day (for period_start on month notes). Local time, not
+    UTC — matches how the user thinks about "today".
+    """
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    return (
+        f"Current date: {today.isoformat()}. "
+        f"This week's Monday: {monday.isoformat()}. "
+        f"This month's start: {month_start.isoformat()}."
+    )
 
 
 def _open_checkpoint_db(db_path: str) -> sqlite3.Connection:
@@ -58,7 +165,9 @@ class Agent:
         memory_store: Optional[MemoryStore] = None,
     ):
         self.thread_id = thread_id or daily_thread_id()
-        self.system_message = SystemMessage(content=load_persona())
+        self.system_message = SystemMessage(
+            content=load_persona() + "\n\n" + build_datetime_context()
+        )
 
         # Working memory: SqliteSaver by default; tests can inject MemorySaver.
         # Own the sqlite connection so we can close it cleanly at exit.
@@ -84,7 +193,8 @@ class Agent:
         # Tools: built AFTER memory so forget_session and recall can close
         # over the agent's stores. Closure capture is the simplest binding;
         # ToolManager doesn't need to know about agent-specific tools.
-        tm = ToolManager()
+        self._tm = ToolManager()
+        tm = self._tm
         self.tools = tm.get_tools() + [
             self._make_forget_session_tool(),
             self._make_recall_tool(),
@@ -92,8 +202,20 @@ class Agent:
 
         llm = llm if llm is not None else make_llm()
         self.llm = llm.bind_tools(self.tools)
-        self.config = {"configurable": {"thread_id": self.thread_id}}
+        # callbacks: ToolCallLogger emits a start/done/error line per tool call
+        # so a hang is visible (a 'start' with no 'done' is the stuck call).
+        self.config = {
+            "configurable": {"thread_id": self.thread_id},
+            "callbacks": [ToolCallLogger()],
+        }
         self.graph = self.build_graph()
+
+    @property
+    def music_active(self) -> bool:
+        return self._tm.music_active
+
+    def clear_music_active(self) -> None:
+        self._tm.music_active = False
 
     def _close_connection(self) -> None:
         if self._conn is not None:
@@ -202,7 +324,22 @@ class Agent:
 
     def build_graph(self):
         def assistant(state: MessagesState):
-            response = self.llm.invoke([self.system_message] + state["messages"])
+            # Only the last MAX_HISTORY_MESSAGES go to the model; the full
+            # thread is still returned below and checkpointed.
+            history = _trim_history(state["messages"], MAX_HISTORY_MESSAGES)
+            # Time the model round-trip so a hang here (e.g. a slow/unreachable
+            # OpenAI call) is distinguishable from a hang inside a tool: you'll
+            # see 'llm start' with no 'llm done'. messages=sent/total shows the
+            # trim at work.
+            t0 = time.monotonic()
+            logger.info(
+                "llm start messages=%d/%d", len(history), len(state["messages"])
+            )
+            response = self.llm.invoke([self.system_message] + history)
+            n_calls = len(getattr(response, "tool_calls", None) or [])
+            logger.info(
+                "llm done  elapsed=%.2fs tool_calls=%d", time.monotonic() - t0, n_calls
+            )
             return {"messages": state["messages"] + [response]}
 
         builder = StateGraph(MessagesState)
