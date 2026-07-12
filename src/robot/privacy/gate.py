@@ -25,6 +25,20 @@ class MicGate:
         self._enabled = enabled
         self._lock = threading.Lock()
         self.max_seconds = max_seconds
+        self._observers: list = []
+
+    def subscribe(self, callback) -> None:
+        """Register `callback(enabled: bool)` to run after every set()/toggle().
+
+        Observers get the new *software* flag. They are invoked outside the
+        gate's lock (an observer may read gate state without deadlocking), and
+        a raising observer is logged and swallowed — a broken subscriber must
+        never block the deafen switch or starve other subscribers. First
+        consumer: ClipService pauses + flushes its buffers on gate-off; the
+        Phase 8 status LED is the planned second.
+        """
+        with self._lock:
+            self._observers.append(callback)
 
     @property
     def enabled(self) -> bool:
@@ -47,11 +61,25 @@ class MicGate:
     def set(self, value: bool) -> None:
         with self._lock:
             self._enabled = value
+        self._notify(value)
 
     def toggle(self) -> bool:
         with self._lock:
             self._enabled = not self._enabled
-            return self._enabled
+            value = self._enabled
+        self._notify(value)
+        return value
+
+    def _notify(self, value: bool) -> None:
+        with self._lock:
+            observers = list(self._observers)
+        for callback in observers:
+            try:
+                callback(value)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "MicGate observer raised; ignoring"
+                )
 
     def set_hardware_mute_pin(self, pin_reader) -> None:
         """Register a hardware mute source (Phase 8 / Pi).

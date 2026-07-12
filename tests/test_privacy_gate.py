@@ -50,3 +50,57 @@ def test_software_off_stays_off_regardless_of_hardware():
     gate = MicGate(enabled=False)
     gate.set_hardware_mute_pin(lambda: False)
     assert gate.enabled is False
+
+
+# --- Observer API (clip plan decision 3A) ---
+
+
+def test_observer_fires_on_set_with_new_value():
+    gate = MicGate(enabled=True)
+    seen = []
+    gate.subscribe(seen.append)
+    gate.set(False)
+    assert seen == [False]
+    gate.set(True)
+    assert seen == [False, True]
+
+
+def test_observer_fires_on_toggle_with_new_value():
+    gate = MicGate(enabled=True)
+    seen = []
+    gate.subscribe(seen.append)
+    assert gate.toggle() is False
+    assert gate.toggle() is True
+    assert seen == [False, True]
+
+
+def test_raising_observer_is_swallowed_and_others_still_fire():
+    gate = MicGate(enabled=True)
+    seen = []
+
+    def boom(value):
+        raise RuntimeError("subscriber bug")
+
+    gate.subscribe(boom)
+    gate.subscribe(seen.append)
+    gate.set(False)  # must not raise
+    assert gate.software_enabled is False  # state change went through
+    assert seen == [False]  # later subscribers unaffected
+
+
+def test_observer_runs_outside_the_lock():
+    # An observer reading gate state would deadlock on the (non-reentrant)
+    # lock if notification happened while holding it.
+    gate = MicGate(enabled=True)
+    seen = []
+    gate.subscribe(lambda value: seen.append(gate.software_enabled))
+    gate.set(False)
+    assert seen == [False]
+
+
+def test_subscribe_does_not_fire_retroactively():
+    gate = MicGate(enabled=True)
+    gate.set(False)
+    seen = []
+    gate.subscribe(seen.append)
+    assert seen == []

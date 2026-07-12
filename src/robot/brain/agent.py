@@ -165,9 +165,13 @@ class Agent:
         memory_store: Optional[MemoryStore] = None,
     ):
         self.thread_id = thread_id or daily_thread_id()
-        self.system_message = SystemMessage(
-            content=load_persona() + "\n\n" + build_datetime_context()
-        )
+        # An explicitly passed thread_id is pinned (tests, off-policy
+        # sessions); only the default day-scoped policy rolls at midnight.
+        self._thread_pinned = thread_id is not None
+        # Persona is read once (file IO); the datetime block is deliberately
+        # NOT baked in here — it's rebuilt per turn in _system_message() so a
+        # process running past local midnight doesn't keep yesterday's date.
+        self._persona = load_persona()
 
         # Working memory: SqliteSaver by default; tests can inject MemorySaver.
         # Own the sqlite connection so we can close it cleanly at exit.
@@ -209,6 +213,31 @@ class Agent:
             "callbacks": [ToolCallLogger()],
         }
         self.graph = self.build_graph()
+
+    def _system_message(self) -> SystemMessage:
+        """Fresh system prompt for this turn: static persona + live datetime.
+
+        Rebuilt on every LLM call (string concat, no file IO) so the date the
+        model sees is always wall-clock. Baking it in at construction meant a
+        robot started before midnight kept yesterday's date until restart.
+        """
+        return SystemMessage(content=self._persona + "\n\n" + build_datetime_context())
+
+    def _roll_thread_if_new_day(self) -> None:
+        """Adopt today's thread when the local date changes under a running
+        process. Keeps the 'conversations reset overnight' contract true for
+        a 24/7 process, not just one that happens to be restarted daily.
+        No-op for pinned (explicitly passed) thread_ids."""
+        if self._thread_pinned:
+            return
+        current = daily_thread_id()
+        if current != self.thread_id:
+            logger.info("daily thread rollover from=%s to=%s", self.thread_id, current)
+            self.thread_id = current
+            self.config = {
+                **self.config,
+                "configurable": {"thread_id": current},
+            }
 
     @property
     def music_active(self) -> bool:
@@ -303,6 +332,7 @@ class Agent:
         Brain-side on purpose: episodic memory lives with the Brain, so the
         Edge/transport seam stays clean for the Phase 8 Pi/Mac split.
         """
+        self._roll_thread_if_new_day()
         input_message = HumanMessage(content=input_text)
         parts: list[str] = []
         for chunk, metadata in self.graph.stream(
@@ -335,7 +365,7 @@ class Agent:
             logger.info(
                 "llm start messages=%d/%d", len(history), len(state["messages"])
             )
-            response = self.llm.invoke([self.system_message] + history)
+            response = self.llm.invoke([self._system_message()] + history)
             n_calls = len(getattr(response, "tool_calls", None) or [])
             logger.info(
                 "llm done  elapsed=%.2fs tool_calls=%d", time.monotonic() - t0, n_calls

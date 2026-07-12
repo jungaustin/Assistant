@@ -224,8 +224,15 @@ def make_tts_engine():
     )
 
 
-def make_stt_recorder():
-    """Build the STT recorder. Returns an object with a .text() method."""
+def make_stt_recorder(on_recording_start=None):
+    """Build the STT recorder. Returns an object with a .text() method.
+
+    `on_recording_start` fires when capture actually begins — wake word,
+    follow-up-window bypass, or hotkey force_start() alike. That single hook
+    is the clip service's snapshot trigger (clip plan decision 2A): any moment
+    Nemo starts listening is a moment "clip that" might be said about the
+    preceding minute.
+    """
     if STT_PROVIDER == "realtimestt":
         from RealtimeSTT import AudioToTextRecorder
 
@@ -254,6 +261,7 @@ def make_stt_recorder():
             wakeword_backend="oww",
             openwakeword_model_paths="models/wake/nemo.onnx",
             openwakeword_inference_framework="onnx",
+            on_recording_start=on_recording_start,
         )
     raise ValueError(
         f"Unknown STT_PROVIDER={STT_PROVIDER!r}. "

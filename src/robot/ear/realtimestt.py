@@ -2,8 +2,18 @@ from robot.config import make_stt_recorder
 
 
 class SpeechToText:
-    def __init__(self, recorder=None):
-        self.recorder = recorder if recorder is not None else make_stt_recorder()
+    def __init__(self, recorder=None, recorder_factory=None):
+        """`recorder_factory` is a zero-arg callable building a fresh recorder.
+
+        Injecting the factory (rather than the recorder alone) matters for
+        restart(): a recorder built with extra wiring — e.g. the clip
+        service's on_recording_start snapshot hook — must come back with the
+        same wiring after crash recovery, not as a bare default recorder.
+        """
+        self._recorder_factory = (
+            recorder_factory if recorder_factory is not None else make_stt_recorder
+        )
+        self.recorder = recorder if recorder is not None else self._recorder_factory()
 
     def listen(self):
         return self.recorder.text()
@@ -95,4 +105,4 @@ class SpeechToText:
             old.shutdown()
         except Exception:
             pass
-        self.recorder = make_stt_recorder()
+        self.recorder = self._recorder_factory()
