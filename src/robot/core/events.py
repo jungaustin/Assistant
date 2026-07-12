@@ -77,6 +77,15 @@ class SpeakChunk(_Base):
     text: str
 
 
+class BrainDone(_Base):
+    """The Brain finished a turn. Terminates the BrainToken stream and carries
+    the per-turn flags the Edge reads after speaking (today: music_active, so
+    the Edge can skip the follow-up window while music plays)."""
+
+    type: Literal["brain_done"] = "brain_done"
+    music_active: bool = False
+
+
 # ---------- Operational ----------
 
 
@@ -109,6 +118,7 @@ Event = Annotated[
         BrainToken,
         BrainToolCall,
         SpeakChunk,
+        BrainDone,
         Heartbeat,
         Error,
     ],
@@ -123,6 +133,7 @@ __all__ = [
     "BrainToken",
     "BrainToolCall",
     "SpeakChunk",
+    "BrainDone",
     "Heartbeat",
     "Error",
 ]

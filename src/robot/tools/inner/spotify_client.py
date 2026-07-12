@@ -1,13 +1,49 @@
 import requests
 import urllib.parse
+import functools
 
 from datetime import datetime, timedelta
 from rapidfuzz import process
 # from flask import Flask, redirect, request, jsonify, session
 
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key, find_dotenv
 load_dotenv()
+
+
+class SpotifyReauthRequired(Exception):
+    """The stored Spotify refresh token is no longer valid.
+
+    Spotify refresh tokens expire after six months (policy effective
+    2026-07-20). An expired or revoked token makes the token endpoint return
+    {"error": "invalid_grant"}. Per Spotify's guidance the only fix is to
+    discard the dead token (no retry) and run the OAuth bootstrap again to
+    mint a fresh one — see setup/spotify_oauth_bootstrap.py.
+    """
+
+
+_REAUTH_MESSAGE = (
+    "Spotify needs to be re-authorized — the saved login has expired. "
+    "Run the Spotify setup again (python setup/spotify_oauth_bootstrap.py), "
+    "log in once, and a new token will be saved automatically."
+)
+
+
+def _reauth_guard(method):
+    """Turn a SpotifyReauthRequired into a calm, speakable message.
+
+    Tool methods are handed straight to the LLM, so an unhandled exception
+    would surface as a stack trace. Catching it here lets the robot tell the
+    user what to do instead of crashing the turn.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except SpotifyReauthRequired:
+            return _REAUTH_MESSAGE
+    return wrapper
+
 
 class SpotifyClient:
     def __init__(self):
@@ -30,17 +66,57 @@ class SpotifyClient:
         }
     
     def refresh_token(self):
-        if not self.is_token_valid():
-            req_body = {
-                'grant_type' : 'refresh_token',
-                'refresh_token' : self.REFRESH_TOKEN,
-                'client_id' : self.CLIENT_ID,
-                'client_secret' : self.CLIENT_SECRET
-            }
-            response = requests.post(self.TOKEN_URL, data = req_body)
-            new_token_info = response.json()
-            self.access_token = new_token_info['access_token']
-            self.expires_at = datetime.now().timestamp() + new_token_info['expires_in']
+        if self.is_token_valid():
+            return
+
+        if not self.REFRESH_TOKEN:
+            raise SpotifyReauthRequired("No Spotify refresh token is stored.")
+
+        req_body = {
+            'grant_type' : 'refresh_token',
+            'refresh_token' : self.REFRESH_TOKEN,
+            'client_id' : self.CLIENT_ID,
+            'client_secret' : self.CLIENT_SECRET
+        }
+        response = requests.post(self.TOKEN_URL, data = req_body)
+        new_token_info = response.json()
+
+        if response.status_code != 200:
+            # A refresh token that has expired (six-month policy, effective
+            # 2026-07-20) or been revoked comes back as invalid_grant. Discard
+            # it and signal re-auth — do NOT retry, per Spotify's guidance.
+            if new_token_info.get('error') == 'invalid_grant':
+                self.REFRESH_TOKEN = None
+                self.access_token = None
+                self.expires_at = None
+                raise SpotifyReauthRequired(
+                    new_token_info.get('error_description', 'invalid_grant')
+                )
+            raise RuntimeError(
+                f"Spotify token refresh failed "
+                f"({response.status_code}): {new_token_info}"
+            )
+
+        self.access_token = new_token_info['access_token']
+        self.expires_at = datetime.now().timestamp() + new_token_info['expires_in']
+
+        # Spotify may rotate the refresh token on refresh; the old one then
+        # stops working. Persist any replacement so the next process start
+        # doesn't wrongly think it needs re-auth.
+        rotated = new_token_info.get('refresh_token')
+        if rotated and rotated != self.REFRESH_TOKEN:
+            self.REFRESH_TOKEN = rotated
+            self._persist_refresh_token(rotated)
+
+    def _persist_refresh_token(self, token: str) -> None:
+        # Best-effort write-back to .env. A failure here must not break
+        # playback — we still hold a valid access token in memory.
+        try:
+            dotenv_path = find_dotenv(usecwd=True)
+            if dotenv_path:
+                set_key(dotenv_path, 'REFRESH_TOKEN', token)
+        except Exception:
+            pass
 
     def get_device_id(self):
         if not self.is_token_valid():
@@ -54,6 +130,7 @@ class SpotifyClient:
                 self.device_id = device['id']
                 break
 
+    @_reauth_guard
     def play_song(self, query : str) -> str:
         if not self.is_token_valid():
             self.refresh_token()
@@ -90,6 +167,7 @@ class SpotifyClient:
         else:
             return f"Failed to play song. Status code: {response.status_code}"
     
+    @_reauth_guard
     def get_my_playlists(self):
         if not self.is_token_valid():
             self.refresh_token()
@@ -129,6 +207,7 @@ class SpotifyClient:
         result = process.extractOne(user_input, self.playlists.keys(), score_cutoff=threshold)
         return result[0] if result else None
     
+    @_reauth_guard
     def play_playlist(self, input : str) -> str:
         if not self.is_token_valid():
             self.refresh_token()
@@ -170,6 +249,7 @@ class SpotifyClient:
         else:
             return f"Failed to play playlist. Status code: {response.status_code}"
 
+    @_reauth_guard
     def shuffle(self, state : bool) -> str:
         if not self.is_token_valid():
             self.refresh_token()
@@ -187,6 +267,7 @@ class SpotifyClient:
         else:
             return f"Failed to shuffle"
     
+    @_reauth_guard
     def pause_playback(self) -> str:
         if not self.is_token_valid():
             self.refresh_token()
@@ -207,6 +288,7 @@ class SpotifyClient:
         else:
             return f"An Error has Occured: Status Code {response.status_code}"
         
+    @_reauth_guard
     def play_playback(self) -> str:
         if not self.is_token_valid():
             self.refresh_token()

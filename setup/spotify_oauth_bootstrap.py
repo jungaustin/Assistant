@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from flask import Flask, redirect, request, jsonify, session
 
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key, find_dotenv
 load_dotenv()
 
 app = Flask(__name__)
@@ -43,7 +43,6 @@ def login():
     }
     
     auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
-    3
     return redirect(auth_url)
 
 @app.route('/callback')
@@ -63,12 +62,27 @@ def callback():
         response = requests.post(TOKEN_URL, data= req_body)
         token_info = response.json()
         print(token_info)
-        
+
+        if 'refresh_token' not in token_info:
+            return jsonify(token_info), 400
+
+        refresh_token = token_info['refresh_token']
+
         session['access_token'] = token_info['access_token']
-        session['refresh_token'] = token_info['refresh_token']
+        session['refresh_token'] = refresh_token
         session['expires_at'] = datetime.now().timestamp() + token_info['expires_in']
-        
-        return redirect('play-song')
+
+        # Save the refresh token straight into .env so the runtime picks it up.
+        # find_dotenv(usecwd=True) resolves to robot/.env when this is launched
+        # as `python setup/spotify_oauth_bootstrap.py` from the project root.
+        dotenv_path = find_dotenv(usecwd=True) or os.path.join(os.getcwd(), '.env')
+        set_key(dotenv_path, 'REFRESH_TOKEN', refresh_token)
+
+        return (
+            "<h2>Spotify connected.</h2>"
+            f"<p>A fresh refresh token was saved to <code>{dotenv_path}</code>.</p>"
+            "<p>You can close this tab and stop the script (Ctrl+C).</p>"
+        )
 
 @app.route('/playlists')
 def get_playlists():

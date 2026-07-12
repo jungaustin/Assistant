@@ -32,6 +32,14 @@ class InProcessTransport:
     def __init__(self, brain: Brain):
         self.brain = brain
 
+    @property
+    def music_active(self) -> bool:
+        return getattr(self.brain, "music_active", False)
+
+    def clear_music_active(self) -> None:
+        if hasattr(self.brain, "clear_music_active"):
+            self.brain.clear_music_active()
+
     async def respond(self, utterance: str) -> AsyncIterator[str]:
         loop = asyncio.get_running_loop()
         gen = self.brain.stream(utterance)

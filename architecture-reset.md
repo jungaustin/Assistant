@@ -360,17 +360,31 @@ set that makes future changes safe.
 **Goal:** Run Edge on a Pi, Brain on the Mac, talking over WebSocket.
 This is what the whole architecture has been pointing at.
 
-### 8.1 WebSocket transport
-- [ ] `transport/websocket.py` — implements the same `Transport` protocol as `InProcessTransport`
-- [ ] Server side (Mac): receives events, dispatches to Brain, streams tokens back
-- [ ] Client side (Pi): wraps Ear/Voice, forwards events
-- [ ] Reconnect with exponential backoff
-- [ ] Auth: shared-secret token in `.env`
+### 8.1 WebSocket transport — ✅ DONE 2026-07-07
+
+> Shipped as `transport/websocket.py` (client + server in one module so the
+> wire format can't drift). Wire protocol is the typed events from
+> `core/events.py`: TranscriptReady in; BrainToken stream out, terminated by
+> BrainDone (added — carries `music_active`) or Error. `BrainServer` reuses
+> `InProcessTransport` internally for the to-thread streaming. Failure UX per
+> plan §1.6: the Edge transport never raises into the voice loop — brain
+> unreachable / dropped link / brain exception each end in a short spoken
+> phrase. Liveness = websockets' built-in ping/pong, so the custom Heartbeat
+> events stayed unused. Entry points: `just brain` (Mac side) and `just edge`
+> (Edge-only, TRANSPORT=websocket); Agent import in main.py is now lazy so an
+> Edge-only process never loads the LangChain stack (half of 8.4 for free).
+> Tests: tests/test_websocket_transport.py (9 cases, loopback sockets).
+
+- [x] `transport/websocket.py` — implements the same `Transport` protocol as `InProcessTransport`
+- [x] Server side (Mac): receives events, dispatches to Brain, streams tokens back
+- [x] Client side (Pi): wraps Ear/Voice, forwards events
+- [x] Reconnect with exponential backoff (per-turn connect attempts; safe one-shot resend when the link died before the first token)
+- [x] Auth: shared-secret token in `.env` (`TRANSPORT_TOKEN`, checked at the HTTP handshake; server refuses to start without one)
 
 ### 8.2 Cross-machine smoke test
-- [ ] Run server on Mac, "client" still on Mac (loopback) — verify works
+- [x] Run server on Mac, "client" still on Mac (loopback) — verify works *(2026-07-07: real Agent + Ollama over ws://localhost:8799; two-turn conversation with a tool call and cross-turn context both worked)*
 - [ ] Run client on a second Mac/laptop over Wi-Fi — verify works
-- [ ] Latency budget check: total round-trip should still be under 2s perceived
+- [ ] Latency budget check: total round-trip should still be under 2s perceived *(loopback: first token ~3.3–3.9s on a tool-call turn — same ballpark as inproc qwen2.5:32b, transport overhead negligible; the 2s budget is a model-latency question, not a transport one)*
 
 ### 8.3 Pi hardware
 - [ ] (Per desk-robot-plan Phase 3) buy hardware after Phase 1 of that plan passes
