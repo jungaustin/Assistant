@@ -42,6 +42,14 @@ STT_SILERO_DEACTIVITY = os.getenv("STT_SILERO_DEACTIVITY", "true").lower() == "t
 # match the existing load path exactly; flip on for a lighter CPU footprint.
 STT_SILERO_USE_ONNX = os.getenv("STT_SILERO_USE_ONNX", "false").lower() == "true"
 
+# Pin the capture device by (case-insensitive substring of) its PyAudio name,
+# e.g. "MacBook Pro Microphone". Empty = system default input. Pinning matters
+# with Bluetooth headphones: if the headset becomes the default input and the
+# robot captures from it, macOS drops the headset into low-quality HFP mode.
+# Pinning the built-in mic keeps the headset output-only (crisp A2DP audio).
+# Matched by name, not index — indices shift as devices connect/disconnect.
+STT_INPUT_DEVICE = os.getenv("STT_INPUT_DEVICE", "")
+
 MIC_ENABLED_DEFAULT = os.getenv("MIC_ENABLED", "true").lower() == "true"
 MAX_UTTERANCE_SECONDS = int(os.getenv("MAX_UTTERANCE_SECONDS", "30"))
 CAMERA_LOG_PATH = os.getenv("CAMERA_LOG_PATH", "camera_access.log")
@@ -116,6 +124,51 @@ DAILY_REQUIRED_TYPES = [
     for t in os.getenv("DAILY_REQUIRED_TYPES", "calories,exercise,sleep").split(",")
     if t.strip()
 ]
+
+# Clip-that (the "clip that" dashcam loop — core/clip.py). Off by default:
+# it opens a second mic stream and a screen capture at boot, which should be
+# a deliberate opt-in per machine (and needs Screen Recording TCC granted to
+# whatever launches the robot).
+CLIP_ENABLED = os.getenv("CLIP_ENABLED", "false").lower() == "true"
+# Engine numbers below are the Phase 1 gate results (prototype/clip-gate/
+# REPORT.md) — the 5s segment interval especially is a locked engine fact
+# (fixed-interval fMP4; save rides the boundary), not a tuning knob.
+CLIP_SEGMENT_SECONDS = float(os.getenv("CLIP_SEGMENT_SECONDS", "5"))
+CLIP_WINDOW_SECONDS = float(os.getenv("CLIP_WINDOW_SECONDS", "60"))
+# 8 Mbps kept terminal/browser text legible on the QHD display at the gate;
+# if the built-in Retina panel ever looks soft, raise this first (the RAM
+# disk budget below may grow to 512 with it).
+CLIP_BITRATE = int(os.getenv("CLIP_BITRATE", "8000000"))
+CLIP_RAMDISK_MB = int(os.getenv("CLIP_RAMDISK_MB", "256"))
+CLIP_SNAPSHOT_TTL = float(os.getenv("CLIP_SNAPSHOT_TTL", "120"))
+CLIP_SAVE_DIR = os.getenv("CLIP_SAVE_DIR", "~/Movies/Nemo Clips")
+# Relative to robot/ (the justfile cwd), like PERSONA_PATH and the model
+# paths. Built by `just build-clip-recorder`.
+CLIP_RECORDER_BIN = os.getenv(
+    "CLIP_RECORDER_BIN", "native/clip-recorder/nemo-clip-recorder"
+)
+
+
+def make_clip_service(speak=None):
+    """Build the ClipService from CLIP_* config (clip plan decision 4A).
+
+    `speak` is the fire-and-forget voice callback the watchdog uses for its
+    once-per-incident failure notices. The caller owns lifecycle: start()
+    after boot, attach_gate() on the MicGate, stop() on shutdown.
+    """
+    from robot.core.clip import ClipService
+
+    return ClipService(
+        recorder_binary=CLIP_RECORDER_BIN,
+        save_dir=CLIP_SAVE_DIR,
+        ramdisk_mb=CLIP_RAMDISK_MB,
+        bitrate=CLIP_BITRATE,
+        segment_seconds=CLIP_SEGMENT_SECONDS,
+        window_seconds=CLIP_WINDOW_SECONDS,
+        snapshot_ttl=CLIP_SNAPSHOT_TTL,
+        speak=speak,
+    )
+
 
 # Tavily web search API key. Get one at https://tavily.com.
 # Used by the web_search tool for voice-optimized answer synthesis.
@@ -224,6 +277,39 @@ def make_tts_engine():
     )
 
 
+def resolve_input_device_index(name_fragment: str) -> int | None:
+    """Find a PyAudio input device whose name contains `name_fragment`.
+
+    Case-insensitive substring match over input-capable devices only (a
+    Bluetooth headset shows up as both input and output; matching on outputs
+    could pin playback hardware as a mic). Returns the device index, or None
+    when the fragment is empty or nothing matches — the caller falls back to
+    the system default input, because a missing device (headset off, mic
+    renamed) must degrade to "works like before", never refuse to listen.
+
+    Resolved fresh on every recorder build (start-up and watchdog restarts),
+    so the index is correct even though CoreAudio renumbers devices as they
+    connect and disconnect.
+    """
+    if not name_fragment:
+        return None
+    import pyaudio
+
+    needle = name_fragment.strip().lower()
+    p = pyaudio.PyAudio()
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if (
+                info.get("maxInputChannels", 0) > 0
+                and needle in str(info.get("name", "")).lower()
+            ):
+                return i
+    finally:
+        p.terminate()
+    return None
+
+
 def make_stt_recorder(on_recording_start=None):
     """Build the STT recorder. Returns an object with a .text() method.
 
@@ -234,12 +320,23 @@ def make_stt_recorder(on_recording_start=None):
     preceding minute.
     """
     if STT_PROVIDER == "realtimestt":
+        import logging
+
         from RealtimeSTT import AudioToTextRecorder
 
         from robot.voice.beep import wake_beep
 
+        # Pin the mic (see STT_INPUT_DEVICE). None = system default input.
+        input_device_index = resolve_input_device_index(STT_INPUT_DEVICE)
+        if STT_INPUT_DEVICE and input_device_index is None:
+            logging.getLogger(__name__).warning(
+                "stt input device %r not found; using system default input",
+                STT_INPUT_DEVICE,
+            )
+
         return AudioToTextRecorder(
             model=STT_MODEL,
+            input_device_index=input_device_index,
             # No terminal spinner: it's redundant with the beeps/logs, and
             # RealtimeSTT's abort() sets state to "transcribing" even when
             # nothing was captured, so the spinner printed a misleading

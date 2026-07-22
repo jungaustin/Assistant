@@ -7,11 +7,13 @@ server (robot.brain_server) — loopback today, the Pi/Mac split at Phase 8.
 import asyncio
 import re
 import signal
+import threading
 import time
 from difflib import SequenceMatcher
 
 from robot.config import (
     BRAIN_WS_URL,
+    CLIP_ENABLED,
     ECHO_SIMILARITY_THRESHOLD,
     FOLLOWUP_POST_SPEECH_DELAY,
     FOLLOWUP_WINDOW_SECONDS,
@@ -22,6 +24,7 @@ from robot.config import (
     TRANSPORT,
     TRANSPORT_TOKEN,
 )
+from robot.core.clip import ClipError, is_clip_command
 from robot.core.logging import configure_logging, get_logger
 
 # Disabled: daily reminder check-in.
@@ -89,12 +92,31 @@ class Edge:
         mic_gate: MicGate | None = None,
         speech_to_text=None,
         text_to_speech=None,
+        clip_service=None,
     ):
         self.transport = transport
         self.mic_gate = mic_gate or MicGate()
         # Injectable so tests can drive the listen loop without real audio.
         self.speech_to_text = speech_to_text or SpeechToText()
         self.text_to_speech = text_to_speech or TextToSpeech()
+        # Optional ClipService (clip plan 9A): when present, canonical
+        # "clip that" phrasings save via the keyword fast-path below without
+        # a Brain round-trip. None = clipping disabled.
+        self.clip_service = clip_service
+
+    @staticmethod
+    def _set_mic_capture(stt, on: bool) -> None:
+        """Mute/unmute the Ear's own audio capture, if it supports it.
+
+        Best-effort: a fake/alternate Ear without set_microphone (tests,
+        other engines) just keeps capturing continuously as before."""
+        set_mic = getattr(stt, "set_microphone", None)
+        if set_mic is None:
+            return
+        try:
+            set_mic(on)
+        except Exception:
+            log.exception("stt set_microphone failed")
 
     @staticmethod
     def _force_stop(stt) -> None:
@@ -352,7 +374,18 @@ class Edge:
             await asyncio.to_thread(q.put, sentinel)
 
         pump_task = asyncio.create_task(pump())
-        await asyncio.to_thread(self.text_to_speech.speak, sync_iter())
+        # Mute the recorder's own capture for the duration of playback — its
+        # wake-word/VAD thread runs continuously in the background (not just
+        # during our listen() calls), so without this it can hear its own
+        # TTS coming out of the speaker. Unmute unconditionally afterward:
+        # if the mic was already off for another reason (deafened), the run
+        # loop's mic_gate check upstream still keeps us from acting on
+        # anything captured.
+        self._set_mic_capture(self.speech_to_text, False)
+        try:
+            await asyncio.to_thread(self.text_to_speech.speak, sync_iter())
+        finally:
+            self._set_mic_capture(self.speech_to_text, True)
         await pump_task
         result = "".join(spoken_text).strip()
         log.info(
@@ -361,6 +394,40 @@ class Edge:
         if result:
             print(f"assistant: {result}")
         return result
+
+    async def _speak_text(self, text: str) -> str:
+        """Speak a fixed string through the normal streaming pipeline, so it
+        gets the same chunking/sanitizing/logging as a Brain reply."""
+
+        async def one():
+            yield text
+
+        return await self._speak_stream(one())
+
+    def _start_clip_save(self) -> None:
+        """Kick the pending snapshot's save off-loop (fast-path, 9A).
+
+        The spoken ack happens immediately; the save itself waits ≤6s for
+        the boundary segment and remuxes, so it runs on its own thread. A
+        failure is spoken when it surfaces — it may land during the
+        follow-up window, which is acceptable for a rare error (same call
+        we made for the check-in's interjections).
+        """
+
+        def worker():
+            try:
+                path = self.clip_service.save()
+                print(f"clip saved: {path}")
+            except ClipError as exc:
+                print(f"assistant (clip): {exc.spoken}")
+                try:
+                    self.text_to_speech.speak(exc.spoken)
+                except Exception:
+                    log.exception("clip failure notice failed to speak")
+            except Exception:
+                log.exception("clip save failed unexpectedly")
+
+        threading.Thread(target=worker, name="clip-save", daemon=True).start()
 
     async def run(self):
         # Audible "booted and listening" cue. By this point the Whisper and
@@ -378,8 +445,17 @@ class Edge:
                 # (timestamp, level, logger name) would just be noise.
                 # Pipe stdout to a file and switch to JSON mode for logs.
                 print(f"user: {utterance}")
-                tokens = self.transport.respond(utterance)
-                last_spoken = await self._speak_stream(tokens)
+                if self.clip_service is not None and is_clip_command(utterance):
+                    # Keyword fast-path (9A): ack in <1s, save in the
+                    # background. Paraphrases miss this regex on purpose and
+                    # go to the Brain's save_clip tool instead.
+                    self._start_clip_save()
+                    last_spoken = await self._speak_text(
+                        "Got it — clipping the last minute."
+                    )
+                else:
+                    tokens = self.transport.respond(utterance)
+                    last_spoken = await self._speak_stream(tokens)
                 music_on = self.transport.music_active
                 self.transport.clear_music_active()
                 if music_on:
@@ -411,7 +487,7 @@ class Edge:
             log.info("edge_state", state="listening")
 
 
-def make_transport():
+def make_transport(clip_service=None):
     """Build the Edge's transport per TRANSPORT. Imports are lazy on purpose:
     Edge-only mode (websocket) must not load the Agent's LangChain stack —
     that's the dependency split the Pi relies on at Phase 8.4."""
@@ -423,13 +499,16 @@ def make_transport():
                 "TRANSPORT=websocket needs TRANSPORT_TOKEN set in .env "
                 "(same value as the brain server)."
             )
+        # clip_service stays Edge-side: the keyword fast-path still works,
+        # but a remote brain has no save_clip tool (it can't reach this
+        # process's buffers). Clip-over-transport is Phase 8.3 design work.
         log.info("transport_selected", kind="websocket", url=BRAIN_WS_URL)
         return WebSocketTransport(BRAIN_WS_URL, TRANSPORT_TOKEN)
     if TRANSPORT == "inproc":
         from robot.brain import Agent
 
         log.info("transport_selected", kind="inproc")
-        return InProcessTransport(Agent())
+        return InProcessTransport(Agent(clip_service=clip_service))
     raise SystemExit(
         f"Unknown TRANSPORT={TRANSPORT!r}. Set TRANSPORT=inproc or "
         f"TRANSPORT=websocket in .env."
@@ -453,8 +532,46 @@ def _install_signal_cleanup(loop, task) -> None:
 async def amain():
     configure_logging()
     log.info("edge_starting")
-    transport = make_transport()
-    edge = Edge(transport)
+
+    # Clip-that (opt-in via CLIP_ENABLED). Built before the transport so the
+    # inproc Agent can register the save_clip tool against the same instance
+    # the Edge snapshots through. The speak callback closes over `edge`,
+    # which exists by the time any watchdog notice fires.
+    clip_service = None
+    speech_to_text = None
+    if CLIP_ENABLED:
+        from robot.config import make_clip_service, make_stt_recorder
+
+        def _clip_speak(message: str) -> None:
+            print(f"assistant (clip): {message}")
+            try:
+                edge.text_to_speech.speak(message)
+            except Exception:
+                log.exception("clip notice failed to speak")
+
+        clip_service = make_clip_service(speak=_clip_speak)
+        # The snapshot hook rides the recorder factory (decisions 2A + 7A):
+        # on_recording_start fires on wake-word, follow-up bypass, and
+        # hotkey listens alike, and the factory survives watchdog restarts.
+        speech_to_text = SpeechToText(
+            recorder_factory=lambda: make_stt_recorder(
+                on_recording_start=clip_service.take_snapshot
+            )
+        )
+
+    transport = make_transport(clip_service)
+    edge = Edge(transport, speech_to_text=speech_to_text, clip_service=clip_service)
+
+    if clip_service is not None:
+        # Gate off = instant pause + flush of all unsaved footage (3A).
+        clip_service.attach_gate(edge.mic_gate)
+        try:
+            clip_service.start()
+        except Exception:
+            # Boot must survive a broken capture stack (missing helper
+            # binary, no RAM disk perms). save_clip then answers with its
+            # not-running phrase instead of the robot failing to start.
+            log.exception("clip service failed to start; running without it")
 
     _install_signal_cleanup(asyncio.get_running_loop(), asyncio.current_task())
 
@@ -462,7 +579,9 @@ async def amain():
     # trigger), PgDn = deafen. An event tap swallows both keys system-wide
     # while the robot runs (see keys.py for why hidutil remapping was a bust).
     # Best-effort — if Accessibility isn't granted the robot runs voice-only.
-    hotkeys = HotkeyListener(HotkeyController(edge.mic_gate, edge.speech_to_text))
+    hotkeys = HotkeyListener(
+        HotkeyController(edge.mic_gate, edge.speech_to_text, edge.text_to_speech)
+    )
     hotkeys.start()
 
     # Disabled: daily reminder check-in. Its own TrackerDB connection on
@@ -481,6 +600,11 @@ async def amain():
     finally:
         # checkin_task.cancel()
         hotkeys.stop()
+        if clip_service is not None:
+            # Stops the capture helper and ejects the RAM disk — which also
+            # destroys unsaved footage, the privacy rule. SIGKILL skips this;
+            # `just _sweep-clip-ramdisk` wipes the orphan at next launch.
+            clip_service.stop()
         # Shut the STT subprocesses down cleanly, otherwise a Ctrl-C/crash
         # orphans them and they spin forever logging EOFError.
         edge.speech_to_text.shutdown()

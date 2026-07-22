@@ -2,6 +2,7 @@ from typing import Callable
 
 from robot.config import TRACKER_DB_PATH
 from robot.tools.inner.calendar_tools import CalendarTools
+from robot.tools.inner.clip_tools import ClipTools
 from robot.tools.inner.discord_tools import DiscordTools
 from robot.tools.inner.generic_tools import GenericTools
 from robot.tools.inner.google_calendar import GoogleCalendar
@@ -14,7 +15,7 @@ from robot.tools.inner.web_tools import WebTools
 
 
 class ToolManager:
-    def __init__(self):
+    def __init__(self, clip_service=None):
         # music_active: set True when playback starts, False when paused.
         # The Edge reads this after each turn to decide whether to open the
         # follow-up listen window (skip it while music is playing so STT
@@ -37,23 +38,32 @@ class ToolManager:
         # Discord client is lazy too: no HTTP until a tool call, so a
         # missing DISCORD_BOT_TOKEN doesn't break boot.
         self.discord_tools = DiscordTools()
+        # Clip service is constructor-injected (clip plan 4A): the same
+        # instance the Edge snapshots/fast-paths through. None = clipping
+        # disabled; the save_clip tool is then not registered at all, so a
+        # disabled feature costs zero tool-budget tokens per turn.
+        self.clip_tools = ClipTools(clip_service)
         self.tools = self.initialize_tools()
 
     def _starts_music(self, fn: Callable) -> Callable:
         """Wrap a tool function so it sets music_active=True on success."""
+
         def wrapper(*args, **kwargs):
             result = fn(*args, **kwargs)
             self.music_active = True
             return result
+
         wrapper.__name__ = fn.__name__
         return wrapper
 
     def _pauses_music(self, fn: Callable) -> Callable:
         """Wrap a tool function so it sets music_active=False on success."""
+
         def wrapper(*args, **kwargs):
             result = fn(*args, **kwargs)
             self.music_active = False
             return result
+
         wrapper.__name__ = fn.__name__
         return wrapper
 
@@ -86,6 +96,8 @@ class ToolManager:
         all_tools.append(self.discord_tools.create_catch_up_discord_tool())
         all_tools.append(self.discord_tools.create_mark_discord_read_tool())
         all_tools.append(self.discord_tools.create_list_discord_channels_tool())
+        if self.clip_tools.available:
+            all_tools.append(self.clip_tools.create_save_clip_tool())
 
         # Patch the Spotify tools that start or stop playback so music_active
         # stays in sync. We do this after creating the StructuredTools and

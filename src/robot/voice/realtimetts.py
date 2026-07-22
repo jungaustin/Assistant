@@ -16,5 +16,17 @@ class TextToSpeech:
         starts playing as soon as the first chunk is ready."""
         self.engine.speak(text_or_generator)
 
+    @property
+    def is_speaking(self) -> bool:
+        """True while speak() is playing. False for engines that don't
+        expose the flag (they simply can't be barged in on)."""
+        return bool(getattr(self.engine, "is_speaking", False))
+
+    def stop(self):
+        """Interrupt playback now (barge-in). No-op if the engine can't stop."""
+        stop = getattr(self.engine, "stop", None)
+        if stop is not None:
+            stop()
+
     def shutdown_engine(self):
         self.engine.shutdown()

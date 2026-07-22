@@ -25,6 +25,36 @@ import sys
 import structlog
 
 
+class RealtimeSTTPipeNoiseFilter(logging.Filter):
+    """Drop RealtimeSTT's teardown pipe-close spam from the log.
+
+    RealtimeSTT's poll_connection thread reads a multiprocessing pipe in a
+    loop bounded by a shutdown_event. On shutdown()/restart() the transcription
+    child closes its end of the pipe *before* that thread notices the event, so
+    conn.recv() raises EOFError — which its bare ``except Exception`` logs to
+    the root logger (with a full traceback) every TIME_SLEEP until the flag is
+    finally seen. The result is a burst of identical "Error receiving data from
+    connection" tracebacks that mean nothing: we tore the recorder down on
+    purpose (see ear/realtimestt.py shutdown()/restart()).
+
+    We suppress only the pipe-closed family (EOFError/BrokenPipeError) carrying
+    that specific message. Any other exception from that code path — or that
+    message without a pipe-closed cause — still passes through, so a real pipe
+    fault during normal operation is not hidden.
+    """
+
+    _NEEDLE = "Error receiving data from connection"
+    _PIPE_CLOSED = (EOFError, BrokenPipeError)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._NEEDLE not in record.getMessage():
+            return True
+        exc_type = record.exc_info[0] if record.exc_info else None
+        if exc_type is not None and issubclass(exc_type, self._PIPE_CLOSED):
+            return False  # drop the teardown-race noise
+        return True
+
+
 def _resolve_format() -> str:
     """`json` or `human`. Env var wins; otherwise auto-detect from TTY."""
     forced = os.getenv("LOG_FORMAT", "").lower()
@@ -82,6 +112,8 @@ def configure_logging(level: str | None = None) -> None:
 
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
+    # Silence RealtimeSTT's EOFError pipe-close burst on recorder teardown.
+    handler.addFilter(RealtimeSTTPipeNoiseFilter())
 
     root = logging.getLogger()
     # Idempotency: replace handlers we installed earlier.

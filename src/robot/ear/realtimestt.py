@@ -43,6 +43,26 @@ class SpeechToText:
         """
         self.recorder.stop()
 
+    def set_microphone(self, on: bool) -> None:
+        """Gate the recorder's background audio capture at the source.
+
+        RealtimeSTT's wake-word/VAD thread runs continuously once the
+        recorder exists, independent of listen() — so it's still capturing
+        (and can pick up our own TTS audio) even between explicit listen()
+        calls. This flips the recorder's own use_microphone flag, which its
+        audio worker checks before feeding any frames into the pipeline, so
+        `on=False` stops capture at the source rather than just skipping our
+        own listen() call. No-op if the recorder doesn't support it (e.g. a
+        test fake).
+        """
+        set_mic = getattr(self.recorder, "set_microphone", None)
+        if set_mic is None:
+            return
+        try:
+            set_mic(on)
+        except Exception:
+            pass
+
     def force_start(self) -> None:
         """Begin recording immediately, bypassing the wake word.
 

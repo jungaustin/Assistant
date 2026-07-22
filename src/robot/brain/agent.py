@@ -5,6 +5,7 @@ conversation memory to sqlite so the process survives restart.
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import sqlite3
 import time
@@ -44,6 +45,52 @@ def _truncate(value, limit: int = 200) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… (+{len(s) - limit} chars)"
+
+
+def _dedupe_tool_calls(response):
+    """Collapse byte-identical tool calls the model emitted in one turn.
+
+    A single assistant turn occasionally carries the *same* tool call twice —
+    identical name and identical args — which is almost never intended and,
+    for a data-logging tool like log_entry, silently double-writes the user's
+    data (e.g. logging one meal as two 720-cal entries). This is a known model
+    failure mode, not something the user asked for.
+
+    We key on (name, canonical-JSON of args) and keep the first occurrence.
+    Because our OpenAI payload is rebuilt from `AIMessage.tool_calls`
+    (_lc_messages_to_openai), dropping a call here also drops it from the
+    serialized assistant message, so no orphaned tool_call id survives to
+    trip OpenAI's "tool_call without a response" 400 on the next round-trip.
+
+    Distinct args are left untouched — two different log_entry calls in one
+    turn (logging lunch and dinner together) are legitimate and pass through.
+    Returns `response` unchanged when there's nothing to drop.
+    """
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if len(tool_calls) < 2:
+        return response
+
+    seen: set[tuple[str, str]] = set()
+    deduped: list = []
+    for tc in tool_calls:
+        try:
+            args_key = json.dumps(tc.get("args") or {}, sort_keys=True)
+        except (TypeError, ValueError):
+            args_key = repr(tc.get("args"))
+        key = (tc.get("name", ""), args_key)
+        if key in seen:
+            logger.warning(
+                "dropped duplicate tool call name=%s args=%s",
+                tc.get("name"),
+                _truncate(tc.get("args")),
+            )
+            continue
+        seen.add(key)
+        deduped.append(tc)
+
+    if len(deduped) != len(tool_calls):
+        response.tool_calls = deduped
+    return response
 
 
 def _trim_history(messages: list, max_messages: int) -> list:
@@ -163,6 +210,7 @@ class Agent:
         thread_id: Optional[str] = None,
         checkpointer: Optional[SqliteSaver] = None,
         memory_store: Optional[MemoryStore] = None,
+        clip_service=None,
     ):
         self.thread_id = thread_id or daily_thread_id()
         # An explicitly passed thread_id is pinned (tests, off-policy
@@ -197,7 +245,9 @@ class Agent:
         # Tools: built AFTER memory so forget_session and recall can close
         # over the agent's stores. Closure capture is the simplest binding;
         # ToolManager doesn't need to know about agent-specific tools.
-        self._tm = ToolManager()
+        # clip_service (clip plan 4A) rides through to the save_clip tool;
+        # None (the default) means no clip tool is registered.
+        self._tm = ToolManager(clip_service=clip_service)
         tm = self._tm
         self.tools = tm.get_tools() + [
             self._make_forget_session_tool(),
@@ -366,6 +416,10 @@ class Agent:
                 "llm start messages=%d/%d", len(history), len(state["messages"])
             )
             response = self.llm.invoke([self._system_message()] + history)
+            # The model sometimes emits the same tool call twice in one turn;
+            # for log_entry that double-writes the user's data. Drop exact dupes
+            # before ToolNode runs them.
+            response = _dedupe_tool_calls(response)
             n_calls = len(getattr(response, "tool_calls", None) or [])
             logger.info(
                 "llm done  elapsed=%.2fs tool_calls=%d", time.monotonic() - t0, n_calls

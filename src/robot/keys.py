@@ -6,10 +6,10 @@ swallows PgUp/PgDn entirely — no app ever page-scrolls — and dispatches
 them as robot controls. When the robot isn't running the keys revert to
 normal paging.
 
-  Page Up   — wake toggle. Idle → force-start a listen without the wake
-              word (push-to-talk). Already capturing (e.g. a false
-              wake-word trigger) → abort and discard, so the robot doesn't
-              answer something you never said.
+  Page Up   — wake toggle. Talking → stop talking (barge-in). Idle →
+              force-start a listen without the wake word (push-to-talk).
+              Already capturing (e.g. a false wake-word trigger) → abort and
+              discard, so the robot doesn't answer something you never said.
   Page Down — deafen toggle. Flips the MicGate; while off the Edge loop
               won't open the mic at all, wake word included.
 
@@ -47,11 +47,50 @@ VK_DEAFEN = 121  # Page Down
 class HotkeyController:
     """Key-press semantics, separated from the event tap so tests can drive it."""
 
-    def __init__(self, mic_gate, speech_to_text):
+    def __init__(self, mic_gate, speech_to_text, text_to_speech=None):
         self.mic_gate = mic_gate
         self.speech_to_text = speech_to_text
+        self.text_to_speech = text_to_speech
+        # Serialize key actions. Every keypress is dispatched on its own thread
+        # (see HotkeyListener), and RealtimeSTT/PortAudio stream control
+        # (abort/start/stop, plus the TTS sd.stop() barge-in) is NOT safe to
+        # call concurrently — overlapping calls from a spammed button double-free
+        # inside CoreAudio and abort the whole process (SIGABRT / exit 134). We
+        # run one action at a time and DROP (not queue) a press that arrives
+        # while another is in flight, so hammering the key can neither overlap
+        # native calls nor back up a burst of toggles.
+        self._action_lock = threading.Lock()
+
+    def _exclusive(self, key: str, action) -> None:
+        if not self._action_lock.acquire(blocking=False):
+            log.info("hotkey_ignored_busy", key=key)
+            return
+        try:
+            action()
+        finally:
+            self._action_lock.release()
 
     def wake_pressed(self) -> None:
+        self._exclusive("wake", self._wake)
+
+    def deafen_pressed(self) -> None:
+        self._exclusive("deafen", self._deafen)
+
+    def _wake(self) -> None:
+        # Barge-in: if the robot is talking, the wake key shuts it up. Checked
+        # first — ahead of the deafen gate — because silencing the speaker is
+        # about the output, not the mic, so it works even while deafened. One
+        # press stops speech; the follow-up window then reopens the mic, so you
+        # can interrupt and immediately say the next thing.
+        tts = self.text_to_speech
+        if tts is not None and getattr(tts, "is_speaking", False):
+            log.info("hotkey_wake_barge_in")
+            cancel_beep()
+            try:
+                tts.stop()
+            except Exception:
+                log.exception("hotkey tts stop failed")
+            return
         if not self.mic_gate.enabled:
             # Deafened is an explicit state; the wake key doesn't override
             # it. Low blip = "I heard the key but I'm deafened".
@@ -75,7 +114,7 @@ class HotkeyController:
         except Exception:
             log.exception("hotkey force_start failed")
 
-    def deafen_pressed(self) -> None:
+    def _deafen(self) -> None:
         enabled = self.mic_gate.toggle()
         log.info("hotkey_deafen_toggle", mic_enabled=enabled)
         if enabled:

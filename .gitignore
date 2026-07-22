@@ -43,3 +43,5 @@ Reliable Ai Agent With LangGraph Following.py
 
 # Third-party
 node_modules/
+# Compiled native helpers (rebuild with `just build-clip-recorder`)
+native/clip-recorder/nemo-clip-recorder
