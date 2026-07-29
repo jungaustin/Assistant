@@ -64,6 +64,47 @@ class WebTools:
         ]
         return "\n".join(s for s in snippets if s)
 
+    def lookup_food_calories(self, item: str) -> str:
+        """Search the web for one food's calorie count.
+
+        A thin template over web_search rather than a separate integration:
+        the generic tool's description tells the model to answer
+        conversationally, which is wrong here — we want a number. Phrasing
+        the query with "calories per serving" is what reliably gets Tavily's
+        answer synthesis to lead with one.
+        """
+        item = item.strip()
+        if not item:
+            return "No food given to look up."
+        answer = self.web_search(f"{item} calories per serving")
+        if answer.startswith(("Web search isn't configured", "Web search failed", "No results")):
+            return answer
+        return f"Web result for '{item}': {answer}"
+
+    def create_lookup_food_calories_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.lookup_food_calories,
+            name="lookup_food_calories",
+            description=(
+                "Search the web for how many calories a food has. Use for "
+                "restaurant, chain, and packaged items the user hasn't logged "
+                "before — 'Panda Express orange chicken', 'Chipotle burrito "
+                "bowl', a named snack brand.\n\n"
+                "Call lookup_food FIRST. Only come here when the user has no "
+                "usable past log for this item. Skip this entirely for plain "
+                "home foods you can estimate well ('two eggs', 'a bowl of "
+                "rice') — a search round-trip is slow and adds nothing.\n\n"
+                "Arguments:\n"
+                "  item (str): the food, as specific as possible. Include the "
+                "restaurant or brand — 'Panda Express chow mein' beats 'chow "
+                "mein'. One item per call.\n\n"
+                "Returns a short paragraph that should contain a calorie "
+                "number. Pull the number out for the portion the user actually "
+                "ate and use it; if the result is vague or missing a number, "
+                "estimate instead and say that you did."
+            ),
+        )
+
     def create_web_search_tool(self) -> BaseTool:
         return StructuredTool.from_function(
             func=self.web_search,

@@ -20,6 +20,23 @@ from pathlib import Path
 from typing import Optional
 
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
+
+
+class FoodItem(BaseModel):
+    """One item in a meal, for log_meal's batch insert."""
+
+    name: str = Field(description="What the food is, e.g. 'orange chicken'")
+    calories: float = Field(description="Calories for the portion actually eaten")
+
+
+# Words stripped before the word-level fallback in lookup_food. A query like
+# "bowl of rice" should still find "rice and soup" once the phrase match
+# misses, and these carry no signal about what the food is.
+_FOOD_STOPWORDS = {
+    "a", "an", "and", "the", "of", "with", "some", "my", "for",
+    "bowl", "plate", "cup", "slice", "piece", "serving", "order",
+}
 
 
 _SCHEMA = """
@@ -80,6 +97,99 @@ class TrackerDB:
             self._conn.commit()
         value_str = str(value) if value is not None else repr(note)
         return f"Logged: {canonical_type} = {value_str} on {entry_date}."
+
+    def log_meal(
+        self,
+        items: list[FoodItem],
+        entry_date: Optional[str] = None,
+    ) -> str:
+        """Insert one calories row per item in a single transaction.
+
+        Exists so "I had orange chicken, chow mein, and a spring roll" is one
+        tool call instead of three sequential log_entry round-trips — the
+        latency matters over voice. Logging per item rather than as one lump
+        sum is also what makes lookup_food useful later: a 'Panda Express |
+        1900' row teaches nothing, three named rows teach three foods.
+        """
+        if not items:
+            return "No items to log."
+        if not entry_date:
+            entry_date = date.today().isoformat()
+
+        rows = [
+            (entry_date, "calories", float(item.calories), item.name.strip() or None)
+            for item in items
+        ]
+        # One execute per row rather than executemany, purely to collect each
+        # lastrowid: the '#id' in the readback is what lets update_entry fix a
+        # single item ("the chow mein was a large") instead of the meal's last
+        # row, which is all update_entry's default targeting could find.
+        # Still one transaction — the commit happens after the loop.
+        with self._lock:
+            ids = []
+            for row in rows:
+                cur = self._conn.execute(
+                    "INSERT INTO entries (entry_date, type, value, note) VALUES (?, ?, ?, ?)",
+                    row,
+                )
+                ids.append(cur.lastrowid)
+            self._conn.commit()
+
+        total = sum(r[2] for r in rows)
+
+        def fmt(x: float) -> str:
+            return str(int(x)) if float(x) == int(x) else f"{x:.1f}"
+
+        lines = [f"Logged {len(rows)} items on {entry_date}:"]
+        lines += [f"  #{i} | {r[3]} = {fmt(r[2])}" for i, r in zip(ids, rows)]
+        lines.append(f"  total: {fmt(total)}")
+        return "\n".join(lines)
+
+    def lookup_food(self, food: str, limit: int = 5) -> str:
+        """Find what this food was logged as before. Returns a summary table.
+
+        Three passes, widening only when the previous one comes up empty:
+        the whole phrase, then all content words, then any content word. This
+        keeps 'rice' from returning every rice dish when 'kimchi fried rice'
+        is what was asked for, while still finding something for a phrasing
+        that was never logged verbatim.
+        """
+        term = food.strip().lower()
+        if not term:
+            return "No food given to look up."
+
+        def _search(where: str, params: list) -> list:
+            return self._conn.execute(
+                "SELECT LOWER(note) AS food, COUNT(*), AVG(value), MIN(value), "
+                "MAX(value), MAX(entry_date) FROM entries "
+                f"WHERE type = 'calories' AND value IS NOT NULL AND note IS NOT NULL AND {where} "
+                "GROUP BY food ORDER BY MAX(entry_date) DESC, COUNT(*) DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+
+        words = [w for w in term.split() if w not in _FOOD_STOPWORDS and len(w) > 2]
+
+        with self._lock:
+            rows = _search("LOWER(note) LIKE ?", [f"%{term}%"])
+            if not rows and words:
+                clause = " AND ".join("LOWER(note) LIKE ?" for _ in words)
+                rows = _search(clause, [f"%{w}%" for w in words])
+            if not rows and len(words) > 1:
+                clause = " OR ".join("LOWER(note) LIKE ?" for _ in words)
+                rows = _search(clause, [f"%{w}%" for w in words])
+
+        if not rows:
+            return f"No past calorie logs matching '{food}'."
+
+        def fmt(x: float) -> str:
+            return str(int(x)) if float(x) == int(x) else f"{x:.1f}"
+
+        lines = [f"Past logs matching '{food}':"]
+        for note, n, avg, lo, hi, last in rows:
+            times = "1 log" if n == 1 else f"{n} logs"
+            spread = fmt(avg) if lo == hi else f"{fmt(avg)} (range {fmt(lo)}–{fmt(hi)})"
+            lines.append(f"  {note} — {times}, usually {spread}, last on {last}")
+        return "\n".join(lines)
 
     def query_entries(
         self,
@@ -412,6 +522,60 @@ class LogTools:
                 "  'I slept 7.5 hours' → type='sleep', value=7.5\n"
                 "  'mood is a 6 today' → type='mood', value=6\n\n"
                 "Returns 'Logged: ...' on success. Read back what you logged."
+            ),
+        )
+
+    def create_lookup_food_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.db.lookup_food,
+            name="lookup_food",
+            description=(
+                "Look up what a food was logged as BEFORE. ALWAYS call this "
+                "first when the user names a food without giving a calorie "
+                "number — before searching the web and before estimating "
+                "yourself. Most of what the user eats repeats (rice, eggs, "
+                "the usual pizza), and reusing the past number keeps the log "
+                "self-consistent instead of re-guessing a new value each time.\n\n"
+                "Arguments:\n"
+                "  food (str): the food name, as the user said it — 'rice', "
+                "'orange chicken', 'Sam's Club pizza'. One food per call; call "
+                "this once per item when the user lists several.\n"
+                "  limit (int, optional): max distinct foods to return, default 5.\n\n"
+                "Returns past matches as 'food — N logs, usually X (range), "
+                "last on DATE', or a 'No past calorie logs matching' message. "
+                "If there is a clear match, reuse that number. If the matches "
+                "are for a different food than the user meant, ignore them and "
+                "fall back to lookup_food_calories or your own estimate."
+            ),
+        )
+
+    def create_log_meal_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.db.log_meal,
+            name="log_meal",
+            description=(
+                "Log several foods at once, one calories entry per item. Use "
+                "this whenever the user lists more than one thing they ate — "
+                "'I had orange chicken, chow mein, and a spring roll'. Prefer "
+                "it over repeated log_entry calls: it is one round-trip, and "
+                "it keeps each food as its own named row so lookup_food can "
+                "find it next time. NEVER log a multi-item meal as a single "
+                "lump sum like 'Panda Express = 1900'.\n\n"
+                "Resolve each item's calories BEFORE calling this: lookup_food "
+                "first, then lookup_food_calories for restaurant or packaged "
+                "items, then your own estimate as a last resort.\n\n"
+                "Arguments:\n"
+                "  items (list): each item is {name, calories}. name is the "
+                "food as the user said it; calories is a number for the "
+                "portion actually eaten (double it if they had two).\n"
+                "  entry_date (str, optional): ISO date (YYYY-MM-DD) for the "
+                "day the meal was EATEN. Omit for today — same rules as "
+                "log_entry.\n\n"
+                "Returns an itemized list — each row led by '#id' — plus the "
+                "total. Log first, then read the items and total back to the "
+                "user; never ask them to confirm calories beforehand. Keep "
+                "those ids: if the user corrects one item, pass its id to "
+                "update_entry rather than re-logging the meal."
             ),
         )
 

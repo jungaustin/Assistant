@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from robot.tools.inner.log import LogTools, TrackerDB
+from robot.tools.inner.log import FoodItem, LogTools, TrackerDB
 
 
 def _db(tmp_path: Path) -> TrackerDB:
@@ -273,8 +273,12 @@ def test_log_tools_exposes_all_tools(tmp_path: Path):
         lt.create_delete_entry_tool().name,
         lt.create_upsert_period_note_tool().name,
         lt.create_get_period_note_tool().name,
+        lt.create_log_meal_tool().name,
+        lt.create_lookup_food_tool().name,
     }
     assert tool_names == {
+        "log_meal",
+        "lookup_food",
         "log_entry",
         "query_entries",
         "entry_stats",
@@ -283,6 +287,116 @@ def test_log_tools_exposes_all_tools(tmp_path: Path):
         "upsert_period_note",
         "get_period_note",
     }
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# log_meal
+# ---------------------------------------------------------------------------
+
+
+def test_log_meal_inserts_one_row_per_item(tmp_path: Path):
+    db = _db(tmp_path)
+    result = db.log_meal(
+        items=[
+            FoodItem(name="orange chicken", calories=490),
+            FoodItem(name="chow mein", calories=510),
+        ],
+        entry_date="2026-06-05",
+    )
+    assert "total: 1000" in result
+    rows = db.query_entries(type="calories", start_date="2026-06-05", end_date="2026-06-05")
+    assert "orange chicken" in rows
+    assert "chow mein" in rows
+    assert len(rows.splitlines()) == 2
+    db.close()
+
+
+def test_log_meal_returns_ids_update_entry_can_target(tmp_path: Path):
+    """The readback's #ids must let a single item be corrected in place."""
+    db = _db(tmp_path)
+    result = db.log_meal(
+        items=[
+            FoodItem(name="orange chicken", calories=490),
+            FoodItem(name="chow mein", calories=510),
+        ],
+        entry_date="2026-06-05",
+    )
+    chow_line = [ln for ln in result.splitlines() if "chow mein" in ln][0]
+    chow_id = int(chow_line.split("#")[1].split(" ")[0])
+    db.update_entry(entry_id=chow_id, value=770)
+    rows = db.query_entries(type="calories", start_date="2026-06-05", end_date="2026-06-05")
+    assert "770" in rows
+    assert "490" in rows  # the other item is untouched
+    db.close()
+
+
+def test_log_meal_defaults_to_today(tmp_path: Path):
+    db = _db(tmp_path)
+    result = db.log_meal(items=[FoodItem(name="rice", calories=350)])
+    assert date.today().isoformat() in result
+    db.close()
+
+
+def test_log_meal_empty_items(tmp_path: Path):
+    db = _db(tmp_path)
+    assert "No items" in db.log_meal(items=[])
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# lookup_food
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_food_finds_exact_phrase(tmp_path: Path):
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=350, note="bowl of rice", entry_date="2026-06-01")
+    db.log_entry(type="calories", value=370, note="bowl of rice", entry_date="2026-06-02")
+    result = db.lookup_food("bowl of rice")
+    assert "2 logs" in result
+    assert "360" in result
+    assert "2026-06-02" in result
+    db.close()
+
+
+def test_lookup_food_falls_back_to_content_words(tmp_path: Path):
+    """'a bowl of kimchi rice' was never logged verbatim; the words still hit."""
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=850, note="kimchi fried rice", entry_date="2026-06-01")
+    result = db.lookup_food("a bowl of kimchi rice")
+    assert "kimchi fried rice" in result
+    assert "850" in result
+    db.close()
+
+
+def test_lookup_food_phrase_match_wins_over_word_match(tmp_path: Path):
+    """An exact 'rice' phrase hit must not drag in unrelated rice dishes."""
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=350, note="rice", entry_date="2026-06-01")
+    db.log_entry(type="calories", value=900, note="chicken burrito", entry_date="2026-06-02")
+    result = db.lookup_food("rice")
+    assert "burrito" not in result
+    db.close()
+
+
+def test_lookup_food_ignores_non_calorie_entries(tmp_path: Path):
+    db = _db(tmp_path)
+    db.log_entry(type="exercise", value=30, note="rice field walk", entry_date="2026-06-01")
+    assert "No past calorie logs" in db.lookup_food("rice")
+    db.close()
+
+
+def test_lookup_food_no_match(tmp_path: Path):
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=350, note="rice", entry_date="2026-06-01")
+    assert "No past calorie logs" in db.lookup_food("tiramisu")
+    db.close()
+
+
+def test_lookup_food_empty_query(tmp_path: Path):
+    db = _db(tmp_path)
+    assert "No food given" in db.lookup_food("   ")
     db.close()
 
 
