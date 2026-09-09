@@ -23,8 +23,11 @@ beat, which is fine and arguably correct prosody.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import AsyncIterator, Iterable, Iterator
+
+logger = logging.getLogger(__name__)
 
 MAX_CHARS = 80
 
@@ -38,6 +41,20 @@ MAX_CHARS = 80
 _SPEECH_NOISE = re.compile(r"[*`]+")
 _DOUBLE_SPACE = re.compile(r"  +")
 
+# Scripts an English voice cannot pronounce. Piper phonemizes through
+# espeak-ng, which for an en_US voice has no mapping for these and falls back
+# to reading each glyph's Unicode NAME aloud — 38 characters of Thai measured
+# at 34s of audio versus 3.2s for the English equivalent. A local multilingual
+# model that drifts mid-reply therefore turns one sentence into a minute of
+# gibberish the user has to sit through.
+#
+# Allow-list rather than block-list, so a script nobody thought of still gets
+# caught: Basic Latin through Latin Extended-B (U+0000-U+024F) covers English
+# plus accented borrowings ("café", "naïve"), and the General Punctuation
+# range keeps em dashes, curly quotes, and ellipses. Everything above that is
+# dropped. Emoji go too — espeak reads those by name as well.
+_UNSPEAKABLE = re.compile(r"[^\u0000-\u024F\u2010-\u2027\u2030-\u205E]+")
+
 
 def sanitize_for_speech(text: str) -> str:
     """Strip spoken-markup noise (``*``, ``` ` ```) from a chunk bound for TTS.
@@ -48,7 +65,19 @@ def sanitize_for_speech(text: str) -> str:
     `` ** `` as a standalone token would).
     """
     text = _SPEECH_NOISE.sub("", text)
+    if _UNSPEAKABLE.search(text):
+        # Log rather than swallow silently: the audio is now sane, but a model
+        # drifting out of English is a real problem worth seeing in the logs.
+        stripped = _UNSPEAKABLE.sub("", text)
+        logger.warning(
+            "dropped unspeakable characters from TTS chunk: %r -> %r",
+            text,
+            stripped,
+        )
+        text = stripped
     return _DOUBLE_SPACE.sub(" ", text)
+
+
 HARD_BOUNDARIES = (". ", "! ", "? ", "\n")
 SOFT_BOUNDARIES = (", ",)
 ALL_BOUNDARIES = HARD_BOUNDARIES + SOFT_BOUNDARIES

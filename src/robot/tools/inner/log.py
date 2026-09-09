@@ -90,13 +90,18 @@ class TrackerDB:
             entry_date = date.today().isoformat()
         canonical_type = type.strip().lower()
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT INTO entries (entry_date, type, value, note) VALUES (?, ?, ?, ?)",
                 (entry_date, canonical_type, value, note or None),
             )
+            entry_id = cur.lastrowid
             self._conn.commit()
         value_str = str(value) if value is not None else repr(note)
-        return f"Logged: {canonical_type} = {value_str} on {entry_date}."
+        # Lead with the '#id' so an immediate correction ("make that
+        # yesterday") has a row to target. Without it the model's only
+        # move was a second log_entry, which duplicates the entry
+        # instead of moving it.
+        return f"Logged #{entry_id}: {canonical_type} = {value_str} on {entry_date}."
 
     def log_meal(
         self,
@@ -399,6 +404,73 @@ class TrackerDB:
             desc += f" ({enote})"
         return f"Deleted entry #{eid}: {desc} on {edate}."
 
+    def delete_entries(
+        self,
+        entry_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        type: Optional[str] = None,
+        note_contains: Optional[str] = None,
+    ) -> str:
+        """Delete every entry matching the given filters. Returns what went.
+
+        Exists so removing rows never requires the model to produce an id it
+        does not have. Asking for an id forced a query_entries -> delete_entry
+        handoff across two turns, and the model instead batched them, guessed
+        the id, and destroyed an unrelated row (2026-09-01). Here the filters
+        come straight from what the user said ("today", "the Panda ones"), so
+        there is nothing to guess.
+
+        At least one filter is required — a bare call would empty the table.
+        """
+        filters, params = [], []
+        if entry_date:
+            filters.append("entry_date = ?")
+            params.append(entry_date)
+        else:
+            if start_date:
+                filters.append("entry_date >= ?")
+                params.append(start_date)
+            if end_date:
+                filters.append("entry_date <= ?")
+                params.append(end_date)
+        if type:
+            filters.append("type = ?")
+            params.append(type.strip().lower())
+        if note_contains:
+            filters.append("LOWER(note) LIKE ?")
+            params.append(f"%{note_contains.strip().lower()}%")
+
+        if not filters:
+            return (
+                "Refused: deleting needs at least one filter (a date, a type, or "
+                "text to match). Say which entries you mean."
+            )
+
+        where = " AND ".join(filters)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, entry_date, type, value, note FROM entries WHERE {where} "
+                "ORDER BY entry_date, id",
+                params,
+            ).fetchall()
+            if not rows:
+                return "No matching entries — nothing was deleted."
+            self._conn.execute(f"DELETE FROM entries WHERE {where}", params)
+            self._conn.commit()
+
+        # Name every row that went, so the spoken readback is checkable and a
+        # wrong match is obvious immediately rather than at the next total.
+        lines = [f"Deleted {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}:"]
+        for eid, edate, etype, val, note in rows:
+            desc = f"  #{eid} | {edate} | {etype}"
+            if val is not None:
+                desc += f" = {val}"
+            if note:
+                desc += f" ({note})"
+            lines.append(desc)
+        return "\n".join(lines)
+
     def upsert_period_note(
         self,
         period_type: str,
@@ -500,6 +572,19 @@ class LogTools:
             description=(
                 "Log a personal data point — calories, exercise, sleep, weight, mood, "
                 "water, or anything else the user wants to track.\n\n"
+                # Without this paragraph the model answers "Logged 600 for rice."
+                # as plain text whenever the conversation already has any prior
+                # turn — measured 0/4 with one unrelated exchange in history vs
+                # 4/4 with none, while query_entries (which carries a directive
+                # like this one) stayed at 4/4 in both. The write silently never
+                # happens and the user is told it did.
+                "ALWAYS call this tool when the user asks you to log, record, add, "
+                "track, or put down a number. This is the ONLY way data reaches the "
+                "database. Replying 'Logged 600 for rice.' without calling this tool "
+                "writes nothing — the entry is lost and the user is misled into "
+                "thinking it was saved. Never state a confirmation, an id, or a "
+                "total you did not receive back from this tool. This holds no matter "
+                "how long the conversation has been going.\n\n"
                 "Arguments:\n"
                 "  type (str): what is being tracked. Use short lowercase labels like "
                 "'calories', 'exercise', 'sleep', 'mood', 'weight', 'water'. "
@@ -521,7 +606,17 @@ class LogTools:
                 "  'I ran 5k this morning' → type='exercise', note='5k run'\n"
                 "  'I slept 7.5 hours' → type='sleep', value=7.5\n"
                 "  'mood is a 6 today' → type='mood', value=6\n\n"
-                "Returns 'Logged: ...' on success. Read back what you logged."
+                # Deliberately does NOT spell out the success string. Quoting it
+                # here handed the model a ready-made confirmation, and with any
+                # prior turn in the conversation it emitted that template as plain
+                # text instead of calling the tool (0/5). play_song had the same
+                # failure from the persona's canned "Playing." — a fakeable
+                # confirmation anywhere in the prompt is what invites the fake.
+                "The result carries the new row's id. Keep that id: if the user's "
+                "very next message revises this entry ('sorry, make it yesterday', "
+                "'actually 200 not 160'), pass the id to update_entry. Do NOT call "
+                "log_entry a second time — that leaves two rows for one thing they "
+                "ate once."
             ),
         )
 
@@ -656,6 +751,33 @@ class LogTools:
             ),
         )
 
+    def create_delete_entries_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.db.delete_entries,
+            name="delete_entries",
+            description=(
+                "Remove logged entries BY DESCRIPTION rather than by id — this is "
+                "the right tool whenever the user says which entries they mean in "
+                "words: 'remove today's entries', 'delete everything from "
+                "yesterday', 'get rid of the Panda Express ones', 'clear my "
+                "calories for Monday'.\n\n"
+                "Prefer this over delete_entry. It needs no id, so there is "
+                "nothing to guess and no need to call query_entries first. Just "
+                "translate what the user said into the filters below.\n\n"
+                "Arguments (give at least one; they combine with AND):\n"
+                "  entry_date (str): a single ISO day, YYYY-MM-DD. Use this for "
+                "'today', 'yesterday', a named day.\n"
+                "  start_date / end_date (str): ISO bounds for a range.\n"
+                "  type (str): 'calories', 'sleep', etc.\n"
+                "  note_contains (str): matches text inside the note, "
+                "case-insensitive — use the user's own words for the food or "
+                "activity.\n\n"
+                "A call with no filters is refused rather than emptying the log. "
+                "The result names every row removed; read those back so the user "
+                "can catch a wrong match straight away."
+            ),
+        )
+
     def create_delete_entry_tool(self) -> BaseTool:
         return StructuredTool.from_function(
             func=self.db.delete_entry,
@@ -667,6 +789,21 @@ class LogTools:
                 "By default this deletes the MOST RECENTLY logged entry. To target a "
                 "different row, pass entry_id (from the '#id' shown by query_entries) "
                 "or match_type to delete the latest entry of one type.\n\n"
+                # A guessed id deletes a real, unrelated row. On 2026-09-01
+                # "remove today's entries and relog 1,620" produced
+                # query_entries + delete_entry(entry_id=1) in ONE batch — batched
+                # calls run concurrently, so the id was invented and a steak
+                # logged in June was destroyed.
+                "NEVER invent or guess an entry_id, and never take one from a "
+                "number the user just said — '1,620 calories' is a value, not an "
+                "id. If you do not already have the id from a query_entries "
+                "result, call query_entries FIRST and wait for it to come back, "
+                "THEN call this in your next turn with the real id. Do not put "
+                "query_entries and delete_entry in the same batch: they run at "
+                "the same time, so the id would be a guess and a guessed delete "
+                "destroys someone's data.\n\n"
+                "To clear several rows, delete them one id at a time, using ids "
+                "the query actually returned.\n\n"
                 "Arguments (all optional):\n"
                 "  entry_id (int): delete this specific entry id.\n"
                 "  match_type (str): delete the latest entry of this type.\n\n"

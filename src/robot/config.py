@@ -50,6 +50,19 @@ STT_SILERO_USE_ONNX = os.getenv("STT_SILERO_USE_ONNX", "false").lower() == "true
 # Matched by name, not index — indices shift as devices connect/disconnect.
 STT_INPUT_DEVICE = os.getenv("STT_INPUT_DEVICE", "")
 
+# Biases Whisper's decoding toward the words this robot actually hears. Without
+# it "log" was transcribed as "long" essentially every time ("Long for me 240
+# calories for tofu"), and a mangled verb is not something the brain can fully
+# recover from — measured 0/5 real tool calls on that phrasing versus 3/5 on
+# the same sentence with "log". Fixing the word at the source beats arguing
+# with the model downstream. Keep it short: an over-long initial_prompt makes
+# Whisper echo the prompt back on near-silent audio.
+STT_INITIAL_PROMPT = os.getenv(
+    "STT_INITIAL_PROMPT",
+    "Nemo, log 600 calories for rice. Log 240 calories for tofu. "
+    "Log 78 calories for an egg. What's my total for today?",
+)
+
 MIC_ENABLED_DEFAULT = os.getenv("MIC_ENABLED", "true").lower() == "true"
 MAX_UTTERANCE_SECONDS = int(os.getenv("MAX_UTTERANCE_SECONDS", "30"))
 CAMERA_LOG_PATH = os.getenv("CAMERA_LOG_PATH", "camera_access.log")
@@ -93,6 +106,54 @@ BRAIN_WS_PORT = int(os.getenv("BRAIN_WS_PORT", "8765"))
 # TRANSPORT=websocket — the server refuses to start without it, so an open
 # LAN port can never expose an unauthenticated brain.
 TRANSPORT_TOKEN = os.getenv("TRANSPORT_TOKEN", "")
+
+# Spoken when a brain request fails outright (timeout, connection refused,
+# server error). Short and non-technical on purpose: it's heard, not read,
+# and the traceback is already in the log for whoever's debugging.
+BRAIN_ERROR_REPLY = os.getenv(
+    "BRAIN_ERROR_REPLY", "Sorry, my brain didn't answer that time. Try again?"
+)
+
+# How long to wait on one brain request before giving up, and how many times
+# to retry. The openai SDK defaults to 600s with 2 retries — so a wedged or
+# pathologically slow server burns 30 minutes in total silence (observed:
+# three 10-minute 500s while a CPU-bound Ollama ground through the prompt at
+# 4 tok/s). 120s is comfortably above a genuine cold-cache turn (~65s
+# measured under boot load, which is also what a midnight date rollover
+# costs when it invalidates the cached prefix) and far below "user gave up".
+# Retries are off: a voice turn that already blew the budget should surface,
+# not be silently attempted twice more.
+BRAIN_TIMEOUT_SECONDS = float(os.getenv("BRAIN_TIMEOUT_SECONDS", "120"))
+
+# Cap on the corrective retry the fabrication guard fires (brain/agent.py).
+# That retry only runs on a turn that already went wrong, and its answer is
+# discarded unless it produces a real tool call — so a slow one is pure dead
+# air. One took 30.8s on 2026-08-27, turning a failed log into 32s of silence
+# followed by an apology. Short on purpose: better to answer honestly fast.
+FABRICATION_RETRY_TIMEOUT = float(os.getenv("FABRICATION_RETRY_TIMEOUT", "10"))
+BRAIN_MAX_RETRIES = int(os.getenv("BRAIN_MAX_RETRIES", "0"))
+
+# Sampling temperature. Unset, the openai SDK sends nothing and the server
+# applies its own default — for Ollama that's temp=1.0, which on a
+# multilingual model (Qwen is heavily CJK/SEA-trained) is enough to make a
+# reply drift out of English mid-sentence. 0.3 keeps phrasing natural while
+# making that drift rare; it also steadies tool-argument formatting.
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+
+# Pre-warm the brain's prompt cache at startup. The robot's per-turn prefix
+# (persona + tool schemas) is ~8.6k tokens; a local server must run all of it
+# through prompt processing before the first token, which measured ~40s on
+# qwen2.5:14b/Metal. Every later turn reuses the server's cached prefix and
+# starts in ~0.3s. Sending that prefix once at boot — while Whisper and Piper
+# are still loading — moves the cost off the first spoken question.
+# Unset = auto: on when BRAIN_BASE_URL points at a local server, off for the
+# real OpenAI endpoint (where the prefix would be a billed request every boot).
+_PREWARM_ENV = os.getenv("BRAIN_PREWARM", "").strip().lower()
+BRAIN_PREWARM = (
+    _PREWARM_ENV in ("1", "true", "yes")
+    if _PREWARM_ENV in ("1", "true", "yes", "0", "false", "no")
+    else bool(BRAIN_BASE_URL)
+)
 
 # How many recent messages to send to the LLM per call. The full conversation
 # is still checkpointed and searchable via recall(); this only bounds the
@@ -167,6 +228,45 @@ def make_clip_service(speak=None):
         window_seconds=CLIP_WINDOW_SECONDS,
         snapshot_ttl=CLIP_SNAPSHOT_TTL,
         speak=speak,
+    )
+
+
+# DoorDash ordering via the `dd-cli` beta binary (github.com/doordash-oss/
+# doordash-cli). Off by default: these tools can spend real money, so the
+# whole group is opt-in per machine. Requires `dd-cli login` once — the CLI
+# keeps credentials in the OS keychain, so the robot never handles them.
+DOORDASH_ENABLED = os.getenv("DOORDASH_ENABLED", "false").lower() == "true"
+DOORDASH_BIN = os.getenv("DOORDASH_BIN", "dd-cli")
+# Hard ceiling on what the robot may place unattended. An order above this is
+# refused outright and handed back to the user — a backstop against a
+# misheard quantity turning into a $400 order.
+DOORDASH_MAX_ORDER_CENTS = int(os.getenv("DOORDASH_MAX_ORDER_CENTS", "15000"))
+# How long a read-back quote stays valid. Past this the robot re-prices
+# instead of placing, so a confirmation can't be banked and used much later.
+DOORDASH_CONFIRM_TTL = float(os.getenv("DOORDASH_CONFIRM_TTL", "600"))
+# dd-cli requires an --intent string on every command and says DoorDash may
+# review it for research. Default sends a fixed, non-personal string; set
+# true to send the user's own phrasing instead.
+DOORDASH_SHARE_INTENT = os.getenv("DOORDASH_SHARE_INTENT", "false").lower() == "true"
+DOORDASH_TIMEOUT = float(os.getenv("DOORDASH_TIMEOUT", "60"))
+
+
+def make_doordash_client():
+    """Build the DoorDashClient, or None when the feature is off.
+
+    Returns None (rather than raising) when DOORDASH_ENABLED is false so the
+    tool group simply isn't registered — same pattern as the clip service.
+    """
+    if not DOORDASH_ENABLED:
+        return None
+    from robot.tools.inner.doordash_client import DoorDashClient
+
+    return DoorDashClient(
+        binary=DOORDASH_BIN,
+        timeout=DOORDASH_TIMEOUT,
+        max_order_cents=DOORDASH_MAX_ORDER_CENTS,
+        confirm_ttl=DOORDASH_CONFIRM_TTL,
+        share_intent=DOORDASH_SHARE_INTENT,
     )
 
 
@@ -246,11 +346,18 @@ def make_llm():
             model=LLM_MODEL,
             base_url=BRAIN_BASE_URL,
             api_key=BRAIN_API_KEY,
+            temperature=LLM_TEMPERATURE,
+            timeout=BRAIN_TIMEOUT_SECONDS,
+            max_retries=BRAIN_MAX_RETRIES,
         )
     if LLM_PROVIDER == "ollama":
         from langchain_ollama import ChatOllama
 
-        return ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
+        return ChatOllama(
+            model=LLM_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            temperature=LLM_TEMPERATURE,
+        )
     raise ValueError(
         f"Unknown LLM_PROVIDER={LLM_PROVIDER!r}. "
         f"Set LLM_PROVIDER=openai-compat or LLM_PROVIDER=ollama in .env."
@@ -337,6 +444,10 @@ def make_stt_recorder(on_recording_start=None):
         return AudioToTextRecorder(
             model=STT_MODEL,
             input_device_index=input_device_index,
+            # Applied to both the final and the realtime pass — the realtime
+            # one feeds the same transcript when a follow-up window closes.
+            initial_prompt=STT_INITIAL_PROMPT or None,
+            initial_prompt_realtime=STT_INITIAL_PROMPT or None,
             # No terminal spinner: it's redundant with the beeps/logs, and
             # RealtimeSTT's abort() sets state to "transcribing" even when
             # nothing was captured, so the spinner printed a misleading

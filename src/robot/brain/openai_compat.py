@@ -40,7 +40,10 @@ def _lc_messages_to_openai(messages: Sequence[BaseMessage]) -> List[dict]:
         elif isinstance(m, HumanMessage):
             out.append({"role": "user", "content": _content_str(m.content)})
         elif isinstance(m, AIMessage):
-            msg: dict[str, Any] = {"role": "assistant", "content": _content_str(m.content)}
+            msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": _content_str(m.content),
+            }
             if m.tool_calls:
                 msg["tool_calls"] = [
                     {
@@ -64,7 +67,9 @@ def _lc_messages_to_openai(messages: Sequence[BaseMessage]) -> List[dict]:
             )
         else:
             # Fallback: best-effort by message type string
-            out.append({"role": getattr(m, "type", "user"), "content": _content_str(m.content)})
+            out.append(
+                {"role": getattr(m, "type", "user"), "content": _content_str(m.content)}
+            )
     return out
 
 
@@ -94,6 +99,10 @@ class OpenAICompatChat(BaseChatModel):
     api_key: Optional[str] = None
     temperature: Optional[float] = None
     tools: Optional[List[dict]] = Field(default=None)
+    # Left None, the SDK applies its own 600s/2-retry default — 30 minutes of
+    # silence on a wedged server. Callers pass real values; see config.py.
+    timeout: Optional[float] = None
+    max_retries: Optional[int] = None
 
     _client: OpenAI = PrivateAttr()
 
@@ -108,13 +117,20 @@ class OpenAICompatChat(BaseChatModel):
             key = "sk-no-key"
         else:
             key = None
-        self._client = OpenAI(base_url=self.base_url, api_key=key)
+        client_kwargs: dict[str, Any] = {"base_url": self.base_url, "api_key": key}
+        if self.timeout is not None:
+            client_kwargs["timeout"] = self.timeout
+        if self.max_retries is not None:
+            client_kwargs["max_retries"] = self.max_retries
+        self._client = OpenAI(**client_kwargs)
 
     @property
     def _llm_type(self) -> str:
         return "openai-compat"
 
-    def bind_tools(self, tools: Sequence[BaseTool | dict], **kwargs: Any) -> "OpenAICompatChat":
+    def bind_tools(
+        self, tools: Sequence[BaseTool | dict], **kwargs: Any
+    ) -> "OpenAICompatChat":
         formatted = [convert_to_openai_tool(t) for t in tools]
         return self.model_copy(update={"tools": formatted})
 
@@ -149,7 +165,14 @@ class OpenAICompatChat(BaseChatModel):
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            tool_calls.append({"id": tc.id, "name": tc.function.name, "args": args, "type": "tool_call"})
+            tool_calls.append(
+                {
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "args": args,
+                    "type": "tool_call",
+                }
+            )
         ai = AIMessage(content=msg.content or "", tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai)])
 

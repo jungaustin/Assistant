@@ -41,6 +41,22 @@ def test_log_entry_defaults_to_today(tmp_path: Path):
     db.close()
 
 
+def test_log_entry_returns_id_update_entry_can_target(tmp_path: Path):
+    """The '#id' is what lets an immediate correction move the row it just
+    created instead of logging a duplicate ('sorry, make that yesterday')."""
+    db = _db(tmp_path)
+    result = db.log_entry(type="calories", value=160, note="Takis")
+    entry_id = int(result.split("#")[1].split(":")[0])
+
+    db.update_entry(entry_id=entry_id, entry_date="2026-08-09")
+
+    assert db.query_entries(type="calories") == "[]"  # gone from today
+    moved = db.query_entries(type="calories", start_date="2026-08-09", end_date="2026-08-09")
+    assert "Takis" in moved
+    assert len(moved.splitlines()) == 1  # moved, not duplicated
+    db.close()
+
+
 def test_log_entry_explicit_entry_date(tmp_path: Path):
     db = _db(tmp_path)
     result = db.log_entry(type="sleep", value=7.5, entry_date="2026-06-01")

@@ -7,7 +7,9 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import re
 import sqlite3
+import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -22,6 +24,8 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from robot.config import (
+    BRAIN_PREWARM,
+    FABRICATION_RETRY_TIMEOUT,
     MAX_HISTORY_MESSAGES,
     MEMORY_DB_PATH,
     STATE_DB_PATH,
@@ -90,6 +94,194 @@ def _dedupe_tool_calls(response):
 
     if len(deduped) != len(tool_calls):
         response.tool_calls = deduped
+    return response
+
+
+# Tools that actually change the log database. A reply claiming one of these
+# happened is only true if the matching tool ran in the same turn.
+_WRITE_TOOLS = {"log_entry", "log_meal", "update_entry"}
+
+# The model sometimes WRITES a tool call instead of making one — it emits
+# "[calling query_entries]" as plain text and then invents the result. Observed
+# on qwen2.5:14b: four meals "logged" that never reached sqlite, followed by a
+# fabricated day's totals read back as fact. Silent data loss is the worst
+# failure this robot has, so both halves get caught here rather than spoken.
+_NARRATED_CALL_RE = re.compile(
+    r"\[\s*(?:call|calls|calling|invoke|invoking|use|using)\s+[a-z_][a-z0-9_]*",
+    re.IGNORECASE,
+)
+
+# "Logged 600 for rice." — a write claim carrying a number. Requiring the digit
+# keeps this off ordinary prose ("I moved it", "saved you a step").
+_CLAIMS_WRITE_RE = re.compile(
+    r"\b(logged|recorded|saved)\b[^.\n]{0,40}?\d", re.IGNORECASE
+)
+
+# "Deleted today's entries." — said on 2026-09-01 about a delete the guessed-id
+# guard had just blocked. The write check above could not see it: log_entry had
+# run that turn, so the turn was not tool-less. A removal claim needs its own
+# check against a removal actually happening.
+_CLAIMS_DELETE_RE = re.compile(
+    r"\b(deleted|removed|cleared|erased|got rid of)\b[^.\n]{0,30}?"
+    r"\b(entry|entries|row|rows|log|logs|one|ones|it|them)\b",
+    re.IGNORECASE,
+)
+
+_FABRICATION_NUDGE = (
+    "Your last reply described a tool call in words instead of making one. "
+    "Writing about a tool does nothing — only a real tool call touches the "
+    "database. Answer again and make the actual call. Never emit bracketed "
+    "text like '[calling log_entry]', and never state a number you did not "
+    "get back from a tool."
+)
+
+# Spoken when the model fabricates twice. Deliberately vague about what failed
+# and explicit that nothing happened — the user has to know not to trust it.
+_FABRICATION_FALLBACK = "Sorry — that didn't go through. Nothing was saved. Ask me again?"
+
+# A deletion that was refused often sits alongside a log that DID succeed, so
+# the generic "nothing was saved" line above would be untrue in the one
+# direction that matters. Keep each message to what actually failed.
+_FABRICATION_FALLBACKS = {
+    "claimed a deletion that no tool performed":
+        "Sorry — I couldn't remove that, so nothing was deleted. "
+        "Ask me to check what's logged and I'll remove it by number.",
+}
+
+
+def _fallback_for(reason: str) -> str:
+    return _FABRICATION_FALLBACKS.get(reason, _FABRICATION_FALLBACK)
+
+
+def _tools_run_this_turn(history: list) -> set[str]:
+    """Names of tools that actually executed since the last user message."""
+    names = set()
+    for msg in reversed(history):
+        if getattr(msg, "type", None) == "human":
+            break
+        if getattr(msg, "type", None) == "tool":
+            name = getattr(msg, "name", None)
+            if name:
+                names.add(name)
+    return names
+
+
+def _fabrication_reason(response, history: list) -> str | None:
+    """Is this reply claiming work that no tool actually did?
+
+    Only ever consulted when the model returned zero tool calls — a reply with
+    real tool calls is about to do the work for real.
+    """
+    if getattr(response, "tool_calls", None):
+        return None
+    text = _content_to_text(getattr(response, "content", None))
+    if not text.strip():
+        return None
+    if _NARRATED_CALL_RE.search(text):
+        return "narrated a tool call in prose"
+    # Any tool actually ran this turn => the reply is grounded in a real result,
+    # so leave it alone. Requiring a *write* tool specifically was too strict: a
+    # legitimate query readback ("You logged 1050 for rice and 240 for tofu,
+    # 1290 total") says "logged" about rows query_entries really returned, and
+    # got blocked. The fabrication this guards against emits a confirmation with
+    # no tool call at all.
+    if _CLAIMS_WRITE_RE.search(text) and not _tools_run_this_turn(history):
+        return "claimed a write that no tool performed"
+    # A removal is checked against removal tools specifically: other tools
+    # running that turn (a log_entry alongside it) say nothing about whether
+    # anything was actually deleted.
+    if _CLAIMS_DELETE_RE.search(text) and not (
+        _tools_run_this_turn(history) & _DESTRUCTIVE_TOOLS
+    ):
+        return "claimed a deletion that no tool performed"
+    return None
+
+
+# Tools that take an entry_id. That id must be one the model actually SAW,
+# never one it inferred.
+_ID_TARGETED_TOOLS = {"delete_entry", "update_entry"}
+
+# Everything that can remove rows. delete_entries takes filters rather than an
+# id, so it needs no id check — but a "I removed it" claim must still be backed
+# by one of these having run.
+_DESTRUCTIVE_TOOLS = {"delete_entry", "update_entry", "delete_entries"}
+
+# Row ids are surfaced as "#331" by log_entry/log_meal/query_entries.
+_ROW_ID_RE = re.compile(r"#(\d+)")
+
+# An id the USER named, which needs an explicit marker to count.
+_SPOKEN_ID_RE = re.compile(r"(?:#|\bentry\s+(?:id\s+)?|\brow\s+)(\d+)", re.I)
+
+
+def _ids_the_model_has_seen(history: list) -> set[str]:
+    """Row ids that appeared in this turn's tool results, or that the user said.
+
+    Anything else in a delete/update call is a guess. On 2026-09-01 the model
+    answered "remove today's entries and relog" by firing query_entries,
+    delete_entry(entry_id=1) and log_entry in ONE batch — ToolNode runs a batch
+    concurrently, so the delete went out before the query could answer, and
+    entry #1 (a steak logged in June) was destroyed instead of today's rows.
+    """
+    seen: set[str] = set()
+    for msg in history:
+        kind = getattr(msg, "type", None)
+        text = _content_to_text(getattr(msg, "content", None))
+        if kind == "tool":
+            # Every tool result still in the window counts, not just this
+            # turn's. "Logged #5" one turn ago is a real row the model saw, and
+            # rejecting it broke the obvious follow-up ("delete that one too").
+            # A stale id at worst deletes nothing; the point of this guard is to
+            # stop INVENTED ids, and an id can only get here by being returned.
+            seen.update(_ROW_ID_RE.findall(text))
+    for msg in reversed(history):
+        kind = getattr(msg, "type", None)
+        text = _content_to_text(getattr(msg, "content", None))
+        if kind == "human":
+            # The user may name an id out loud ("delete entry 328", "#328").
+            # Deliberately NOT any bare number: almost every number the user
+            # says is a calorie value, and "relog 1,620" contains a "1" that
+            # would authorise deleting entry #1 — which is very likely how the
+            # model landed on that id in the first place.
+            seen.update(_SPOKEN_ID_RE.findall(text))
+            break
+    return seen
+
+
+def _drop_unverified_destructive_calls(response, history: list):
+    """Remove delete/update calls targeting an id the model never saw.
+
+    Reads issued in the SAME batch cannot have answered yet, so an id that only
+    a same-batch query could supply is by definition guessed. Dropping the call
+    (rather than running it) lets the tool results come back and the model
+    reissue it against real ids on the next pass.
+    """
+    calls = list(getattr(response, "tool_calls", None) or [])
+    if not any(c.get("name") in _ID_TARGETED_TOOLS for c in calls):
+        return response
+
+    seen = _ids_the_model_has_seen(history)
+    kept = []
+    for call in calls:
+        if call.get("name") in _ID_TARGETED_TOOLS:
+            target = str((call.get("args") or {}).get("entry_id", ""))
+            if target not in seen:
+                logger.error(
+                    "dropped %s(entry_id=%s): id never appeared in a tool result "
+                    "this turn (seen=%s) — refusing to delete a guessed row",
+                    call.get("name"), target, sorted(seen) or "none",
+                )
+                continue
+        kept.append(call)
+
+    if len(kept) != len(calls):
+        response.tool_calls = kept
+        # Dropping the only call leaves an empty turn — the robot just goes
+        # silent, which reads as a crash. Say what happened instead.
+        if not kept and not _content_to_text(getattr(response, "content", None)).strip():
+            response.content = (
+                "I couldn't tell which entry you meant, so I didn't delete "
+                "anything. Tell me the day or the food and I'll remove it."
+            )
     return response
 
 
@@ -273,6 +465,49 @@ class Agent:
         """
         return SystemMessage(content=self._persona + "\n\n" + build_datetime_context())
 
+    def prewarm(self) -> None:
+        """Run the per-turn prefix through the server once so it's cached.
+
+        Sends exactly what a real turn sends — `self.llm` is the tool-bound
+        model, and `_system_message()` is the same persona + datetime block —
+        so the server's cached prefix is a true prefix of every later request
+        rather than a near-miss that re-processes from scratch. The datetime
+        block is date-only, so the prefix stays byte-identical all day (and
+        the midnight change rolls the thread anyway).
+
+        `max_tokens=1` because only prompt processing matters here; the
+        generated token is thrown away. Blocking — call via
+        `start_prewarm()` to overlap it with Whisper/TTS model loading.
+        """
+        t0 = time.monotonic()
+        logger.info("brain prewarm start")
+        try:
+            self.llm.invoke(
+                [self._system_message(), HumanMessage(content="hi")],
+                max_tokens=1,
+            )
+        except Exception:
+            # A cold cache is a slow first question, not a broken robot —
+            # never let this take the process down.
+            logger.exception("brain prewarm failed")
+            return
+        logger.info("brain prewarm done elapsed=%.1fs", time.monotonic() - t0)
+
+    def start_prewarm(self) -> Optional[threading.Thread]:
+        """Fire prewarm() on a daemon thread unless BRAIN_PREWARM is off.
+
+        Daemon so a still-running prewarm can never hold up shutdown. Returns
+        the thread (tests join it); None when disabled.
+        """
+        if not BRAIN_PREWARM:
+            logger.info("brain prewarm skipped (BRAIN_PREWARM off)")
+            return None
+        thread = threading.Thread(
+            target=self.prewarm, name="brain-prewarm", daemon=True
+        )
+        thread.start()
+        return thread
+
     def _roll_thread_if_new_day(self) -> None:
         """Adopt today's thread when the local date changes under a running
         process. Keeps the 'conversations reset overnight' contract true for
@@ -383,19 +618,37 @@ class Agent:
         Edge/transport seam stays clean for the Phase 8 Pi/Mac split.
         """
         self._roll_thread_if_new_day()
+        # Record the turn before the model runs. Tools that need proof of a
+        # real human turn (the DoorDash order gate) read this, not the model's
+        # claims about what was said.
+        self._tm.note_user_turn(input_text)
         input_message = HumanMessage(content=input_text)
         parts: list[str] = []
-        for chunk, metadata in self.graph.stream(
+        # stream_mode="updates", NOT "messages". Token-level streaming emits
+        # text straight from the model as it is generated, which means it is
+        # already in the speaker before the assistant node can judge it — a
+        # fabricated "[calling query_entries] you ate 480 calories" got spoken
+        # in full on 2026-08-26 while the log said "refusing to speak it", and
+        # the corrective retry then spoke its version too. Emitting the node's
+        # returned message instead costs the token-by-token head start (~400ms
+        # on qwen2.5:14b) and buys the guarantee that nothing unvalidated is
+        # ever voiced, and that a retry replaces the first answer rather than
+        # appending to it.
+        for update in self.graph.stream(
             {"messages": [input_message]},
             self.config,
-            stream_mode="messages",
+            stream_mode="updates",
         ):
-            if metadata.get("langgraph_node") != "assistant":
-                continue
-            text = _content_to_text(getattr(chunk, "content", None))
-            if text:
-                parts.append(text)
-                yield text
+            for node, payload in update.items():
+                if node != "assistant" or not payload:
+                    continue
+                messages = payload.get("messages") or []
+                if not messages:
+                    continue
+                text = _content_to_text(getattr(messages[-1], "content", None))
+                if text:
+                    parts.append(text)
+                    yield text
         self.append_episode(input_text, "".join(parts))
 
     def run(self, input_text: str) -> str:
@@ -416,10 +669,43 @@ class Agent:
                 "llm start messages=%d/%d", len(history), len(state["messages"])
             )
             response = self.llm.invoke([self._system_message()] + history)
+
+            # Catch a reply that only *describes* doing the work. One corrective
+            # retry usually lands a real call; a second failure is answered
+            # honestly rather than spoken as if it succeeded.
+            reason = _fabrication_reason(response, history)
+            if reason is not None:
+                logger.warning("fabricated tool call (%s); retrying", reason)
+                retried = None
+                try:
+                    retried = self.llm.invoke(
+                        [self._system_message()]
+                        + history
+                        + [SystemMessage(content=_FABRICATION_NUDGE)],
+                        timeout=FABRICATION_RETRY_TIMEOUT,
+                    )
+                except Exception:
+                    # A retry that hangs is worse than no retry: the user is
+                    # waiting on an answer we already know was wrong.
+                    logger.warning("corrective retry failed; answering honestly")
+
+                if retried is not None and _fabrication_reason(retried, history) is None:
+                    response = retried
+                else:
+                    logger.error(
+                        "fabricated tool call again (%s); refusing to speak it",
+                        reason,
+                    )
+                    response.content = _fallback_for(reason)
+                    response.tool_calls = []
+
             # The model sometimes emits the same tool call twice in one turn;
             # for log_entry that double-writes the user's data. Drop exact dupes
             # before ToolNode runs them.
             response = _dedupe_tool_calls(response)
+            # A guessed entry_id destroys a real row, so this runs before the
+            # tools do, not as a check afterwards.
+            response = _drop_unverified_destructive_calls(response, history)
             n_calls = len(getattr(response, "tool_calls", None) or [])
             logger.info(
                 "llm done  elapsed=%.2fs tool_calls=%d", time.monotonic() - t0, n_calls

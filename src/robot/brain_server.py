@@ -29,6 +29,9 @@ async def amain():
         )
     log.info("brain_server_starting")
     brain = Agent()
+    # Same prompt-cache prewarm as the inproc path: overlap it with the
+    # server coming up so the first Edge request isn't the one that pays it.
+    brain.start_prewarm()
     server = BrainServer(brain, BRAIN_WS_HOST, BRAIN_WS_PORT, TRANSPORT_TOKEN)
     log.info("brain_server_listening", host=BRAIN_WS_HOST, port=BRAIN_WS_PORT)
     await server.serve()

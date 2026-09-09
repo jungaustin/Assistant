@@ -37,8 +37,25 @@ loop (`while not self.shutdown_event.is_set()`) exit, so an orphaned child
 terminates instead of spinning. Any other exception keeps the original
 log-and-retry behavior.
 
+Second bug: abort() can hang forever
+------------------------------------
+AudioToTextRecorder.abort() waits on an event with no timeout:
+
+    if self.state != "inactive":
+        self.was_interrupted.wait()      # unbounded
+        self._set_state("transcribing")
+    if self.is_recording:
+        self.stop()
+
+If the recording loop never sets was_interrupted, abort() never returns. Two
+consequences, both seen on 2026-09-07: the recording is never stopped (the
+self.stop() on the last line is unreachable), and HotkeyController holds its
+action lock for the whole call, so every later Page Up / Page Down is dropped
+as "hotkey_ignored_busy" — the robot's physical buttons go dead until restart.
+Bounded here so abort() always reaches stop().
+
 Idempotent: re-running is a no-op once patched (detected via the PATCH(robot)
-marker). uv sync can reinstall RealtimeSTT and wipe the patch, so this runs
+marker). uv sync can reinstall RealtimeSTT and wipe the patches, so this runs
 from the `just sync` recipe after every sync.
 """
 
@@ -71,26 +88,62 @@ REPLACEMENT = (
 )
 
 
+ABORT_ORIGINAL = (
+    '        if self.state != "inactive": # if inactive, was_interrupted will never be set\n'
+    "            self.was_interrupted.wait()\n"
+    '            self._set_state("transcribing")\n'
+)
+
+ABORT_REPLACEMENT = (
+    '        if self.state != "inactive": # if inactive, was_interrupted will never be set\n'
+    "            # PATCH(robot): bound this wait. It had no timeout, so when the\n"
+    "            # recording loop never set was_interrupted, abort() blocked\n"
+    "            # forever: the recording was never stopped (self.stop() below is\n"
+    "            # unreachable from here) and the caller's lock was held for good,\n"
+    "            # which killed every hotkey until restart. Timing out and\n"
+    "            # continuing still reaches stop(), which is the point of abort().\n"
+    "            if not self.was_interrupted.wait(timeout=2.0):\n"
+    "                logging.warning(\n"
+    "                    \"PATCH(robot) abort(): was_interrupted not set within 2s; \"\n"
+    "                    \"stopping the recorder anyway\"\n"
+    "                )\n"
+    '            self._set_state("transcribing")\n'
+)
+
+
+PATCHES = (
+    ("poll_connection", ORIGINAL, REPLACEMENT),
+    ("abort", ABORT_ORIGINAL, ABORT_REPLACEMENT),
+)
+
+
 class PatchError(RuntimeError):
     """Raised when the source doesn't look like what we expect to patch."""
 
 
 def patch_text(src: str) -> tuple[str, str]:
-    """Return (new_source, status) for a RealtimeSTT source string.
+    """Return (new_source, status) after applying every patch in PATCHES.
 
-    status is "already" (marker present, unchanged) or "patched". Raises
-    PatchError if the poll_connection except block isn't found exactly once,
-    which means RealtimeSTT changed upstream and the patch needs review rather
-    than silently doing the wrong thing.
+    status is "already" (all present, unchanged) or "patched: a, b". Raises
+    PatchError if a target block isn't found exactly once, which means
+    RealtimeSTT changed upstream and the patch needs review rather than
+    silently doing the wrong thing.
     """
-    if MARKER in src:
+    applied = []
+    for name, original, replacement in PATCHES:
+        if replacement in src:
+            continue  # this one is already in place
+        count = src.count(original)
+        if count != 1:
+            raise PatchError(
+                f"expected exactly 1 {name} block to patch, found {count}"
+            )
+        src = src.replace(original, replacement, 1)
+        applied.append(name)
+
+    if not applied:
         return src, "already"
-    count = src.count(ORIGINAL)
-    if count != 1:
-        raise PatchError(
-            f"expected exactly 1 poll_connection except block, found {count}"
-        )
-    return src.replace(ORIGINAL, REPLACEMENT, 1), "patched"
+    return src, "patched: " + ", ".join(applied)
 
 
 def _target_file() -> Path:
@@ -122,7 +175,7 @@ def main() -> int:
         return 0
 
     path.write_text(new_src)
-    print(f"patch_realtimestt: patched poll_connection ({path})")
+    print(f"patch_realtimestt: {status} ({path})")
     return 0
 
 

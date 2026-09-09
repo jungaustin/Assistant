@@ -16,6 +16,7 @@ from robot.core.chunker import (
     MAX_CHARS,
     achunk_tokens,
     chunk_tokens,
+    sanitize_for_speech,
 )
 
 
@@ -169,3 +170,42 @@ async def test_async_chunker_matches_sync():
 async def test_async_chunker_drains_trailing_buffer():
     out = [chunk async for chunk in achunk_tokens(_aiter(["No punct"]))]
     assert out == ["No punct"]
+
+
+# --- unspeakable-script guard -------------------------------------------
+# Piper phonemizes through espeak-ng; an en_US voice has no mapping for
+# non-Latin scripts and reads each glyph's Unicode NAME aloud instead. The
+# drift that prompted this (38 chars of Thai) measured 34s of audio against
+# 3.2s for the English equivalent.
+
+
+def test_strips_non_latin_scripts():
+    assert sanitize_for_speech("คณะกรรมมาธิการ 250") == " 250"
+    assert sanitize_for_speech("你好 there") == " there"
+    assert sanitize_for_speech("Привет there") == " there"
+
+
+def test_keeps_accented_latin_and_punctuation():
+    """Borrowings and typographic punctuation are pronounceable — keep them."""
+    assert sanitize_for_speech("café") == "café"
+    assert sanitize_for_speech("naïve") == "naïve"
+    assert sanitize_for_speech("wait — really?") == "wait — really?"
+    assert sanitize_for_speech("it's “fine”") == "it's “fine”"
+
+
+def test_strips_emoji():
+    assert sanitize_for_speech("done 🎉") == "done "
+
+
+def test_plain_english_is_untouched():
+    assert sanitize_for_speech("Logged 250 calories for rice.") == (
+        "Logged 250 calories for rice."
+    )
+
+
+def test_chunks_still_join_without_losing_spaces():
+    """sanitize runs per chunk and the transcript joins with '' — a chunk's
+    trailing space is what separates it from the next one."""
+    chunks = ["Logged 250. ", "Anything else?"]
+    joined = "".join(sanitize_for_speech(c) for c in chunks)
+    assert joined == "Logged 250. Anything else?"

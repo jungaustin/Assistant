@@ -50,7 +50,19 @@ class SpotifyTools:
         return StructuredTool.from_function(
             func=self.spotify_client.shuffle,
             name='shuffle',
-            description='Turns on or off Shuffling for the current playback on spotify. The function wants true to turn on shuffling, and false to turn off shuffling.'
+            description=(
+                "Turns shuffle on or off for whatever Spotify is ALREADY playing. "
+                "Pass true to turn shuffling on, false to turn it off.\n\n"
+                # "Shuffle my smoothie playlist" called only this, so shuffle was
+                # flipped on whatever happened to be loaded, the playlist never
+                # started, and the user was told it had (2026-09-01).
+                "This does NOT start anything and does NOT choose what plays. It "
+                "cannot act on a named playlist — it takes no playlist argument. "
+                "If the user names a playlist or a song, call play_playlist (or "
+                "play_song) with that name FIRST and then call this. On its own "
+                "this leaves whatever was already loaded playing, which is not "
+                "what the user asked for."
+            )
         )
     def create_pause_tool(self) -> BaseTool:
         return StructuredTool.from_function(
@@ -58,6 +70,21 @@ class SpotifyTools:
             name='pause_playback',
             description='Pauses the playback on spotify. This makes it so that the spotify app stops playing the song until it is resumed.'
         )
+    def create_reauthorize_spotify_tool(self) -> BaseTool:
+        return StructuredTool.from_function(
+            func=self.spotify_client.reauthorize,
+            name='reauthorize_spotify',
+            description=(
+                "Reconnects Spotify when its login has expired. Opens the "
+                "Spotify login page in the user's browser so they can approve "
+                "it with one click, then saves the new token automatically. "
+                "Use this when the user asks to reconnect, re-authorize, log "
+                "back in to, or fix Spotify, or when another Spotify tool "
+                "reports that the login expired. Takes no arguments and may "
+                "take up to a minute while it waits for the user to click."
+            )
+        )
+
     def create_play_tool(self) -> BaseTool:
         return StructuredTool.from_function(
             func=self.spotify_client.play_playback,

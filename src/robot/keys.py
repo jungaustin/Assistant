@@ -32,7 +32,9 @@ watchdog makes from other threads today.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 
 from robot.core.logging import get_logger
 from robot.voice.beep import cancel_beep, mute_beep, ready_beep, wake_beep
@@ -42,6 +44,10 @@ log = get_logger(__name__)
 # macOS virtual keycodes, confirmed by capturing the K2's actual events.
 VK_WAKE = 116  # Page Up
 VK_DEAFEN = 121  # Page Down
+
+# How long one key action may run before we say so. Actions are stream
+# start/stop calls that normally return in milliseconds.
+HOTKEY_SLOW_WARN_SECONDS = float(os.getenv("HOTKEY_SLOW_WARN_SECONDS", "3"))
 
 
 class HotkeyController:
@@ -65,9 +71,30 @@ class HotkeyController:
         if not self._action_lock.acquire(blocking=False):
             log.info("hotkey_ignored_busy", key=key)
             return
+        started = time.monotonic()
+        # A stuck action holds the lock, so every later press is dropped as
+        # "ignored_busy" and the buttons look simply dead — which is how a
+        # RealtimeSTT abort() that blocked forever presented on 2026-09-07.
+        # The hang itself is fixed at the source (scripts/patch_realtimestt.py);
+        # this makes any future one obvious in the log instead of silent.
+        stuck = threading.Timer(
+            HOTKEY_SLOW_WARN_SECONDS,
+            lambda: log.warning(
+                "hotkey_action_stuck",
+                key=key,
+                seconds=HOTKEY_SLOW_WARN_SECONDS,
+                effect="further key presses are being dropped until this returns",
+            ),
+        )
+        stuck.daemon = True
+        stuck.start()
         try:
             action()
         finally:
+            stuck.cancel()
+            elapsed = time.monotonic() - started
+            if elapsed >= HOTKEY_SLOW_WARN_SECONDS:
+                log.warning("hotkey_action_recovered", key=key, elapsed=round(elapsed, 1))
             self._action_lock.release()
 
     def wake_pressed(self) -> None:

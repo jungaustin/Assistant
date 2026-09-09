@@ -175,3 +175,68 @@ def test_ear_errors_never_escape_the_key_handler():
     controller = HotkeyController(gate, ExplodingEar())
     controller.deafen_pressed()
     assert gate.enabled is False
+
+
+# --- a stuck action must be visible, not silent -----------------------------
+
+
+def test_a_stuck_action_is_logged_rather_than_failing_silently(monkeypatch):
+    """2026-09-07: RealtimeSTT.abort() blocked forever, so the action lock was
+    never released and every later press logged only 'hotkey_ignored_busy'.
+    The buttons looked dead with nothing in the log saying why."""
+    import threading as _t
+
+    from robot import keys as keys_mod
+
+    monkeypatch.setattr(keys_mod, "HOTKEY_SLOW_WARN_SECONDS", 0.05)
+    warnings = []
+    monkeypatch.setattr(
+        keys_mod.log, "warning", lambda event, **kw: warnings.append(event)
+    )
+
+    release = _t.Event()
+    ctrl = keys_mod.HotkeyController(mic_gate=object(), speech_to_text=object())
+
+    done = _t.Event()
+
+    def slow():
+        release.wait(5)
+        done.set()
+
+    worker = _t.Thread(target=lambda: ctrl._exclusive("wake", slow), daemon=True)
+    worker.start()
+    _t.Event().wait(0.25)
+    assert "hotkey_action_stuck" in warnings, warnings
+
+    release.set()
+    worker.join(timeout=5)
+    assert done.is_set()
+    assert "hotkey_action_recovered" in warnings, warnings
+
+
+def test_a_fast_action_logs_no_warning(monkeypatch):
+    from robot import keys as keys_mod
+
+    monkeypatch.setattr(keys_mod, "HOTKEY_SLOW_WARN_SECONDS", 5.0)
+    warnings = []
+    monkeypatch.setattr(
+        keys_mod.log, "warning", lambda event, **kw: warnings.append(event)
+    )
+    ctrl = keys_mod.HotkeyController(mic_gate=object(), speech_to_text=object())
+    ctrl._exclusive("wake", lambda: None)
+    assert warnings == []
+
+
+def test_the_lock_is_released_even_if_the_action_raises():
+    from robot import keys as keys_mod
+
+    ctrl = keys_mod.HotkeyController(mic_gate=object(), speech_to_text=object())
+
+    def boom():
+        raise RuntimeError("stream error")
+
+    try:
+        ctrl._exclusive("wake", boom)
+    except RuntimeError:
+        pass
+    assert not ctrl._action_lock.locked(), "a raising action must not wedge the buttons"

@@ -1,14 +1,24 @@
 import requests
 import urllib.parse
 import functools
+import logging
+import threading
 
 from datetime import datetime, timedelta
 from rapidfuzz import process
+
+from robot.tools.inner.spotify_auth import (
+    DEFAULT_REDIRECT_URI,
+    SpotifyAuthFlow,
+    SpotifyAuthUnavailable,
+)
 # from flask import Flask, redirect, request, jsonify, session
 
 import os
 from dotenv import load_dotenv, set_key, find_dotenv
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class SpotifyReauthRequired(Exception):
@@ -22,25 +32,68 @@ class SpotifyReauthRequired(Exception):
     """
 
 
+# Fallback wording for when the browser flow can't run at all (no client
+# credentials, callback port taken, or SPOTIFY_AUTO_REAUTH turned off).
 _REAUTH_MESSAGE = (
     "Spotify needs to be re-authorized — the saved login has expired. "
     "Run the Spotify setup again (python setup/spotify_oauth_bootstrap.py), "
     "log in once, and a new token will be saved automatically."
 )
 
+_BROWSER_OPEN_MESSAGE = (
+    "Spotify's login expired, so I opened the Spotify login page in your "
+    "browser. Approve it there and then ask me again."
+)
+
+_NO_BROWSER_MESSAGE = (
+    "Spotify's login expired and I couldn't open a browser on this machine. "
+    "The login link is in the log — open it, approve it, and ask me again."
+)
+
+_REAUTH_FAILED_MESSAGE = (
+    "That Spotify login didn't go through. Ask me to reconnect Spotify and "
+    "I'll open it again."
+)
+
+# Seconds a tool call blocks waiting for the user to click "Agree". The flow
+# outlives this — the wait only decides whether *this* turn can still finish
+# what the user actually asked for, or has to answer and let them ask again.
+_AUTH_WAIT_SECONDS = float(os.getenv("SPOTIFY_AUTH_WAIT_SECONDS", "60"))
+
+_FALSEY = {"false", "0", "no", "off"}
+
+
+def _auto_reauth_enabled() -> bool:
+    """Set SPOTIFY_AUTO_REAUTH=false to go back to the old behaviour of just
+    telling the user to run the bootstrap script by hand."""
+    return os.getenv("SPOTIFY_AUTO_REAUTH", "true").strip().lower() not in _FALSEY
+
 
 def _reauth_guard(method):
-    """Turn a SpotifyReauthRequired into a calm, speakable message.
+    """Recover from an expired Spotify login without ending the turn.
 
     Tool methods are handed straight to the LLM, so an unhandled exception
-    would surface as a stack trace. Catching it here lets the robot tell the
-    user what to do instead of crashing the turn.
+    would surface as a stack trace. On expiry we open the Spotify login in
+    the user's browser and wait briefly for the one click only a human can
+    make; if they take it, the call they originally asked for is retried and
+    they never have to repeat themselves. If they don't, we fall back to a
+    calm, speakable instruction.
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         try:
             return method(self, *args, **kwargs)
         except SpotifyReauthRequired:
+            pass
+
+        reconnected, message = self.await_reauth()
+        if not reconnected:
+            return message
+        try:
+            return method(self, *args, **kwargs)
+        except SpotifyReauthRequired:
+            # Fresh token, still refused: not something another browser
+            # round-trip will fix.
             return _REAUTH_MESSAGE
     return wrapper
 
@@ -56,6 +109,13 @@ class SpotifyClient:
         self.API_BASE_URL = 'https://api.spotify.com/v1'
         self.TOKEN_URL = 'https://accounts.spotify.com/api/token'
         self.playlists = None
+        # Must match a Redirect URI registered on the Spotify app dashboard.
+        self.REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", DEFAULT_REDIRECT_URI)
+        # At most one browser login in flight. Two Spotify tool calls in the
+        # same turn ("play my smoothie playlist shuffled") both hit the guard,
+        # so they have to share a flow rather than race for the callback port.
+        self._auth_flow: SpotifyAuthFlow | None = None
+        self._auth_lock = threading.Lock()
     
     def is_token_valid(self):
         return self.access_token is not None and datetime.now().timestamp() < self.expires_at
@@ -117,6 +177,97 @@ class SpotifyClient:
                 set_key(dotenv_path, 'REFRESH_TOKEN', token)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Browser re-authorization (six-month refresh-token expiry)
+    # ------------------------------------------------------------------
+
+    def _apply_token_info(self, token_info: dict) -> None:
+        """Adopt tokens from a completed browser login, mid-process.
+
+        Called from the OAuth callback thread, which is why it does the whole
+        job: without this the new token would only reach a *restarted* robot,
+        and the point of the browser flow is that the turn in progress can
+        carry on.
+        """
+        self.access_token = token_info["access_token"]
+        self.expires_at = datetime.now().timestamp() + token_info["expires_in"]
+        refresh = token_info.get("refresh_token")
+        if refresh:
+            self.REFRESH_TOKEN = refresh
+            self._persist_refresh_token(refresh)
+        # The new grant may be for a different Spotify account, and both of
+        # these were cached under the old one.
+        self.device_id = None
+        self.playlists = None
+        logger.info("spotify reauthorized; new refresh token saved")
+
+    def begin_reauth(self) -> SpotifyAuthFlow:
+        """Start (or reuse) the browser login. Returns without waiting.
+
+        Raises SpotifyAuthUnavailable when the flow can't run here at all.
+        """
+        with self._auth_lock:
+            flow = self._auth_flow
+            if flow is not None and flow.pending:
+                # Already waiting on the user — reusing it keeps a second tool
+                # call in the same turn from stacking up browser tabs.
+                return flow
+
+            if not (self.CLIENT_ID and self.CLIENT_SECRET):
+                raise SpotifyAuthUnavailable(
+                    "CLIENT_ID/CLIENT_SECRET are missing from .env"
+                )
+
+            flow = SpotifyAuthFlow(
+                client_id=self.CLIENT_ID,
+                client_secret=self.CLIENT_SECRET,
+                redirect_uri=self.REDIRECT_URI,
+                on_token=self._apply_token_info,
+            )
+            try:
+                flow.start()
+            except OSError as exc:
+                # Port already in use — most often macOS AirPlay Receiver
+                # squatting on 5000, or a bootstrap script still running.
+                raise SpotifyAuthUnavailable(
+                    f"couldn't listen on {self.REDIRECT_URI}: {exc}"
+                ) from exc
+
+            self._auth_flow = flow
+            return flow
+
+    def await_reauth(self, wait_seconds: float | None = None) -> tuple[bool, str]:
+        """Open the Spotify login and wait for the click.
+
+        Returns (reconnected, message_for_the_user). On success the message is
+        empty — the caller has something better to say.
+        """
+        if not _auto_reauth_enabled():
+            return False, _REAUTH_MESSAGE
+
+        try:
+            flow = self.begin_reauth()
+        except SpotifyAuthUnavailable as exc:
+            logger.warning("spotify reauth unavailable: %s", exc)
+            return False, _REAUTH_MESSAGE
+
+        flow.wait(_AUTH_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+
+        if flow.succeeded:
+            return True, ""
+        if flow.done.is_set():
+            return False, _REAUTH_FAILED_MESSAGE
+        if not flow.browser_opened:
+            return False, _NO_BROWSER_MESSAGE
+        return False, _BROWSER_OPEN_MESSAGE
+
+    def reauthorize(self) -> str:
+        """Tool entry point: reconnect Spotify by asking the user to log in."""
+        reconnected, message = self.await_reauth()
+        if reconnected:
+            return "Spotify's reconnected."
+        return message
 
     def get_device_id(self):
         if not self.is_token_valid():

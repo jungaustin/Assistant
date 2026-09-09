@@ -12,6 +12,7 @@ import time
 from difflib import SequenceMatcher
 
 from robot.config import (
+    BRAIN_ERROR_REPLY,
     BRAIN_WS_URL,
     CLIP_ENABLED,
     ECHO_SIMILARITY_THRESHOLD,
@@ -454,8 +455,22 @@ class Edge:
                         "Got it — clipping the last minute."
                     )
                 else:
-                    tokens = self.transport.respond(utterance)
-                    last_spoken = await self._speak_stream(tokens)
+                    try:
+                        tokens = self.transport.respond(utterance)
+                        last_spoken = await self._speak_stream(tokens)
+                    except Exception:
+                        # A brain that times out, drops its connection, or
+                        # errors must not take the robot down mid-conversation
+                        # — the mic loop is the whole product. Say so out loud
+                        # (silence is indistinguishable from "didn't hear you")
+                        # and fall back to wake-word listening. The traceback
+                        # goes to the log for triage.
+                        log.exception("brain request failed")
+                        try:
+                            await self._speak_text(BRAIN_ERROR_REPLY)
+                        except Exception:
+                            log.exception("failed to speak brain error notice")
+                        break
                 music_on = self.transport.music_active
                 self.transport.clear_music_active()
                 if music_on:
@@ -508,7 +523,13 @@ def make_transport(clip_service=None):
         from robot.brain import Agent
 
         log.info("transport_selected", kind="inproc")
-        return InProcessTransport(Agent(clip_service=clip_service))
+        brain = Agent(clip_service=clip_service)
+        # Kick the prompt-cache prewarm here, not after the Edge is built:
+        # it runs on its own thread and overlaps with the Whisper/Piper model
+        # loads that follow, so the cost lands in dead boot time instead of
+        # on the first spoken question.
+        brain.start_prewarm()
+        return InProcessTransport(brain)
     raise SystemExit(
         f"Unknown TRANSPORT={TRANSPORT!r}. Set TRANSPORT=inproc or "
         f"TRANSPORT=websocket in .env."

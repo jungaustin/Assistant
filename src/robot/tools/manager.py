@@ -1,9 +1,10 @@
 from typing import Callable
 
-from robot.config import TRACKER_DB_PATH
+from robot.config import TRACKER_DB_PATH, make_doordash_client
 from robot.tools.inner.calendar_tools import CalendarTools
 from robot.tools.inner.clip_tools import ClipTools
 from robot.tools.inner.discord_tools import DiscordTools
+from robot.tools.inner.doordash_tools import DoorDashTools
 from robot.tools.inner.generic_tools import GenericTools
 from robot.tools.inner.google_calendar import GoogleCalendar
 from robot.tools.inner.log import LogTools, TrackerDB
@@ -43,7 +44,23 @@ class ToolManager:
         # disabled; the save_clip tool is then not registered at all, so a
         # disabled feature costs zero tool-budget tokens per turn.
         self.clip_tools = ClipTools(clip_service)
+        # DoorDash spends real money, so the group is opt-in (DOORDASH_ENABLED)
+        # and additionally skipped when the dd-cli binary isn't installed.
+        # The client also needs to see each user turn — see note_user_turn.
+        self.doordash_tools = DoorDashTools(make_doordash_client())
         self.tools = self.initialize_tools()
+
+    def note_user_turn(self, text: str) -> None:
+        """Record one real user utterance. Called by the Agent per turn.
+
+        This is what makes the order-confirmation gate trustworthy: the
+        DoorDash client checks the recorded transcript itself rather than
+        trusting a 'the user said yes' argument from the model, so the model
+        cannot place an order by asserting consent that never happened.
+        """
+        client = self.doordash_tools.client
+        if client is not None:
+            client.note_user_turn(text)
 
     def _starts_music(self, fn: Callable) -> Callable:
         """Wrap a tool function so it sets music_active=True on success."""
@@ -77,6 +94,7 @@ class ToolManager:
         all_tools.append(self.spotify_tools.create_shuffle_tool())
         all_tools.append(self.spotify_tools.create_pause_tool())
         all_tools.append(self.spotify_tools.create_play_tool())
+        all_tools.append(self.spotify_tools.create_reauthorize_spotify_tool())
         all_tools.append(self.calendar_tools.create_list_calendar_events_tool())
         all_tools.append(self.calendar_tools.create_add_calendar_event_tool())
         all_tools.append(self.calendar_tools.create_delete_calendar_event_tool())
@@ -88,6 +106,7 @@ class ToolManager:
         all_tools.append(self.math_tools.create_calculate_tool())
         all_tools.append(self.log_tools.create_update_entry_tool())
         all_tools.append(self.log_tools.create_delete_entry_tool())
+        all_tools.append(self.log_tools.create_delete_entries_tool())
         all_tools.append(self.log_tools.create_upsert_period_note_tool())
         all_tools.append(self.log_tools.create_get_period_note_tool())
         all_tools.append(self.web_tools.create_web_search_tool())
@@ -101,6 +120,17 @@ class ToolManager:
         all_tools.append(self.discord_tools.create_list_discord_channels_tool())
         if self.clip_tools.available:
             all_tools.append(self.clip_tools.create_save_clip_tool())
+        if self.doordash_tools.available:
+            dd = self.doordash_tools
+            all_tools.append(dd.create_search_tool())
+            all_tools.append(dd.create_menu_tool())
+            all_tools.append(dd.create_add_to_cart_tool())
+            all_tools.append(dd.create_show_cart_tool())
+            all_tools.append(dd.create_remove_from_cart_tool())
+            all_tools.append(dd.create_order_history_tool())
+            all_tools.append(dd.create_review_order_tool())
+            all_tools.append(dd.create_place_order_tool())
+            all_tools.append(dd.create_cancel_order_tool())
 
         # Patch the Spotify tools that start or stop playback so music_active
         # stays in sync. We do this after creating the StructuredTools and

@@ -16,8 +16,16 @@ Generated sine waves via sounddevice rather than afplay/system sounds so the
 same code runs on the Pi after the Phase 8 split. Each tone gets a 5ms linear
 fade in/out — without it the hard edges click audibly.
 
-Playback opens its own PortAudio stream, so cues mix fine over TTS speech or
-Spotify; they never contend with the main voice pipeline.
+Cues mix fine over TTS speech or Spotify, but NOT over each other:
+`sd.play()` drives a single module-global stream and its own docs say it
+"cannot be used for multiple overlapping playbacks" — it calls stop() on
+whatever is already playing. Two beeps landing together therefore had one
+thread closing the CoreAudio stream another was still inside wait() on, which
+surfaced as `PaMacCore ... err='!obj'` / `err='-50'` and then killed the
+process with SIGSEGV. Spamming the deafen key was enough to do it: mute_beep
+is 0.27s long and the toggles arrived ~0.3s apart. `_PLAY_LOCK` below keeps
+exactly one cue in flight; HotkeyController's own lock does not cover this,
+because _fire() returns as soon as the thread is spawned.
 """
 
 from __future__ import annotations
@@ -25,6 +33,22 @@ from __future__ import annotations
 import threading
 
 import numpy as np
+
+# Imported here, on the main thread at startup, rather than inside the worker.
+# `import sounddevice` initialises PortAudio through cffi, and doing that for
+# the first time on a throwaway beep thread is its own crash (SIGSEGV inside
+# ffi_call during module exec). A machine with no audio device must still boot.
+try:
+    import sounddevice as _sd
+except Exception:  # pragma: no cover - depends on host audio setup
+    _sd = None
+
+# One cue at a time. Held across play()+wait() so the next beep cannot stop the
+# stream mid-playback. Beeps are ~0.1-0.3s, so a short block is imperceptible;
+# a cue that cannot get the lock in time is dropped rather than queued, since a
+# beep that arrives late is worse than no beep.
+_PLAY_LOCK = threading.Lock()
+_PLAY_LOCK_TIMEOUT = 1.5
 
 _SAMPLE_RATE = 22050
 _VOLUME = 0.3
@@ -43,7 +67,8 @@ def _tone(freq_hz: float, duration_s: float) -> np.ndarray:
 
 
 def _play_blips(freq_hz: float, duration_s: float, count: int, gap_s: float) -> None:
-    import sounddevice as sd
+    if _sd is None:
+        return
 
     gap = np.zeros(int(_SAMPLE_RATE * gap_s), dtype=np.float32)
     parts: list[np.ndarray] = []
@@ -51,13 +76,18 @@ def _play_blips(freq_hz: float, duration_s: float, count: int, gap_s: float) -> 
         if i:
             parts.append(gap)
         parts.append(_tone(freq_hz, duration_s))
+
+    if not _PLAY_LOCK.acquire(timeout=_PLAY_LOCK_TIMEOUT):
+        return
     try:
-        sd.play(np.concatenate(parts), _SAMPLE_RATE)
-        sd.wait()
+        _sd.play(np.concatenate(parts), _SAMPLE_RATE)
+        _sd.wait()
     except Exception:
         # A beep is a nicety; never let a missing/busy audio device take
         # down the thread that asked for it.
         pass
+    finally:
+        _PLAY_LOCK.release()
 
 
 def _fire(freq_hz: float, duration_s: float, count: int = 1, gap_s: float = 0.07):

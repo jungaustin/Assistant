@@ -1,9 +1,11 @@
-"""Tests for the RealtimeSTT poll_connection patch script.
+"""Tests for the RealtimeSTT patch script.
 
-The script rewrites the vendored library's infinite-loop except block so a
-closed pipe ends the worker instead of spinning on EOFError. These tests drive
-the pure patch_text() transform against a representative source snippet — they
-do NOT touch the real installed file.
+Two fixes are applied to the vendored library: poll_connection's infinite loop
+(a closed pipe must end the worker, not spin on EOFError) and abort()'s
+unbounded was_interrupted.wait() (which hung forever, left the recording
+running, and wedged every hotkey behind the controller's action lock). These
+tests drive the pure patch_text() transform against a representative source
+snippet — they do NOT touch the real installed file.
 """
 
 from __future__ import annotations
@@ -50,12 +52,26 @@ class TranscriptionWorker:
             except Exception as e:
                 logging.error(f"Error receiving data from connection: {e}", exc_info=True)
                 time.sleep(TIME_SLEEP)
+
+
+class AudioToTextRecorder:
+    def abort(self):
+        state = self.state
+        self.start_recording_on_voice_activity = False
+        self.stop_recording_on_voice_deactivity = False
+        self.interrupt_stop_event.set()
+        if self.state != "inactive": # if inactive, was_interrupted will never be set
+            self.was_interrupted.wait()
+            self._set_state("transcribing")
+        self.was_interrupted.clear()
+        if self.is_recording: # if recording, make sure to stop the recorder
+            self.stop()
 '''
 
 
 def test_patches_the_except_block():
     new_src, status = patch_mod.patch_text(_SAMPLE)
-    assert status == "patched"
+    assert status.startswith("patched")
     assert patch_mod.MARKER in new_src
     # The pipe-closed family is now caught before the generic handler.
     assert "except (EOFError, BrokenPipeError, OSError):" in new_src
@@ -91,3 +107,50 @@ def test_installed_library_is_patched():
     import RealtimeSTT.audio_recorder as m
 
     assert patch_mod.MARKER in Path(m.__file__).read_text()
+
+
+# --- abort() must not be able to block forever -----------------------------
+
+
+def test_abort_wait_is_given_a_timeout():
+    """Unbounded, abort() never returned: the recording was never stopped (the
+    self.stop() after the wait is unreachable) and HotkeyController held its
+    action lock for good, so every Page Up / Page Down logged only
+    'hotkey_ignored_busy'. Seen 2026-09-07."""
+    new_src, _ = patch_mod.patch_text(_SAMPLE)
+    assert "self.was_interrupted.wait()\n" not in new_src, "bare wait must be gone"
+    assert "self.was_interrupted.wait(timeout=2.0)" in new_src
+
+
+def test_abort_still_reaches_stop_after_a_timeout():
+    new_src, _ = patch_mod.patch_text(_SAMPLE)
+    abort_src = new_src[new_src.index("    def abort(self):"):]
+    # Match the executable line, not the words "self.stop()" inside the patch's
+    # own explanatory comment — which is what this assertion caught first.
+    stop_line = "\n            self.stop()"
+    assert stop_line in abort_src
+    assert abort_src.index("wait(timeout=2.0)") < abort_src.index(stop_line)
+
+
+def test_patched_abort_is_valid_python():
+    new_src, _ = patch_mod.patch_text(_SAMPLE)
+    ast.parse(new_src)
+
+
+def test_both_patches_are_applied_and_named():
+    _, status = patch_mod.patch_text(_SAMPLE)
+    assert "poll_connection" in status and "abort" in status, status
+
+
+def test_applying_twice_is_a_no_op():
+    once, _ = patch_mod.patch_text(_SAMPLE)
+    twice, status = patch_mod.patch_text(once)
+    assert status == "already"
+    assert twice == once
+
+
+def test_a_missing_target_is_reported_not_silently_skipped():
+    """If upstream changes the code we patch, fail loudly — a silently skipped
+    patch means the hang comes back without anyone noticing."""
+    with pytest.raises(patch_mod.PatchError):
+        patch_mod.patch_text("class AudioToTextRecorder:\n    pass\n")
