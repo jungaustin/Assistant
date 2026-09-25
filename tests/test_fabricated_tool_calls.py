@@ -21,6 +21,7 @@ from robot.brain.agent import (
     _FABRICATION_FALLBACK,
     _NARRATED_CALL_RE,
     _fabrication_reason,
+    _scrub_history,
     _tools_run_this_turn,
 )
 
@@ -686,3 +687,71 @@ def test_honest_turns_and_the_current_turn_are_kept():
         ToolMessage(content="#2 logged 600", name="log_entry", tool_call_id="e1"),
     ]
     assert _scrub_history(thread) == thread
+
+
+# The claim checks used to fire on anything with "added/updated/recorded/#" and
+# a digit, so ordinary replies about calendars, timers and trivia were blocked
+# as fake log writes, answered with "Nothing was saved", retried with a nudge
+# to make a tool call, and scrubbed from the next turn's context.
+
+
+def _turn(user: str, tools: list[tuple[str, str]]) -> list:
+    history = [HumanMessage(content=user)]
+    if tools:
+        history.append(_ai("", [
+            {"name": name, "args": {}, "id": f"{name}-{i}"}
+            for i, (name, _) in enumerate(tools)
+        ]))
+        history += [
+            ToolMessage(content=out, name=name, tool_call_id=f"{name}-{i}")
+            for i, (name, out) in enumerate(tools)
+        ]
+    return history
+
+
+def test_replies_outside_the_log_are_not_flagged():
+    cases = [
+        (_turn("add dentist tomorrow 3pm", [("add_calendar_event", "Created.")]),
+         "Added the dentist to your calendar for 3 PM tomorrow."),
+        (_turn("move it to 4", [("add_calendar_event", "Created.")]),
+         "Updated it to 4 PM."),
+        (_turn("hottest temperature ever?", []),
+         "The record high is 134 degrees Fahrenheit, in Death Valley in 1913."),
+        (_turn("apple earnings?", [("web_search", "Apple revenue 94.9B")]),
+         "Apple recorded revenue of 94.9 billion dollars."),
+        (_turn("top song?", [("web_search", "Golden tops the chart")]),
+         "Golden is the #1 song right now."),
+    ]
+    for history, text in cases:
+        assert _fabrication_reason(_ai(text), history) is None, text
+
+
+def test_a_real_calendar_delete_may_say_it_deleted():
+    history = _turn("cancel my dentist appointment", [
+        ("list_calendar_events", "abc Dentist"),
+        ("delete_calendar_event", "Deleted abc."),
+    ])
+    assert _fabrication_reason(_ai("Deleted it."), history) is None
+
+
+def test_deleted_with_no_tool_at_all_is_still_caught():
+    history = _turn("cancel my dentist appointment", [])
+    assert _fabrication_reason(_ai("Deleted it."), history) is not None
+
+
+def test_meal_readback_after_a_correction_is_not_flagged():
+    history = _turn("rice and kimchi for lunch", [
+        ("log_meal", "Logged 2 items on 2026-09-25:\n  #12 | rice = 250\n"
+                     "  #13 | kimchi = 30\n  total: 280"),
+    ]) + [_ai("rice: 250\nkimchi: 30\ntotal: 280")]
+    history += _turn("actually the kimchi was 50", [
+        ("update_entry", "Updated entry #13 (calories): value 30.0 → 50."),
+    ])
+    assert _fabrication_reason(_ai("Fixed.\nrice: 250\nkimchi: 50"), history) is None
+
+
+def test_a_legit_calendar_turn_stays_in_context():
+    history = _turn("add dentist tomorrow 3pm", [("add_calendar_event", "Created.")])
+    history += [_ai("Added the dentist for 3 PM tomorrow."),
+                HumanMessage(content="actually make it 4")]
+    assert _scrub_history(history) == history

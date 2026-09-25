@@ -100,6 +100,7 @@ def _dedupe_tool_calls(response):
 # Tools that actually change the log database. A reply claiming one of these
 # happened is only true if the matching tool ran in the same turn.
 _WRITE_TOOLS = {"log_entry", "log_meal", "update_entry"}
+_INSERT_TOOLS = {"log_entry", "log_meal"}
 
 # The model sometimes WRITES a tool call instead of making one — it emits
 # "[calling query_entries]" as plain text and then invents the result. Observed
@@ -140,6 +141,18 @@ _CLAIMS_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The two claim checks above match generic verbs ("updated", "added",
+# "recorded") next to any digit, which is most of what the robot says about
+# anything: "Added the dentist for 3 PM", "The record high is 134 degrees",
+# "Apple recorded 94.9 billion". Those were being blocked as fabricated log
+# writes, answered with "Nothing was saved", retried with a nudge to make a
+# tool call, and then scrubbed from history. Only a reply that is actually
+# about the log is checked against the log.
+_LOG_DOMAIN_RE = re.compile(
+    r"\b(log|logged|logging|calories?|cals?|kcal|entry|entries|rows?|meals?)\b",
+    re.IGNORECASE,
+)
+
 # "Deleted today's entries." — said on 2026-09-01 about a delete the guessed-id
 # guard had just blocked. The write check above could not see it: log_entry had
 # run that turn, so the turn was not tool-less. A removal claim needs its own
@@ -171,12 +184,15 @@ def _as_number(raw: str):
         return None
 
 
-def _values_written_this_turn(history: list) -> set[float]:
-    """Every number a write tool actually returned since the last user message."""
+def _values_written(history: list) -> set[float]:
+    """Every number a write tool returned anywhere in the prompt window.
+
+    Window-wide, not this turn only: after "add a side of rice to lunch" the
+    readback lists the whole meal, and the rows written last turn are just as
+    real as the one written now.
+    """
     values: set[float] = set()
-    for msg in reversed(history):
-        if getattr(msg, "type", None) == "human":
-            break
+    for msg in history:
         if getattr(msg, "type", None) != "tool":
             continue
         if getattr(msg, "name", None) not in _WRITE_TOOLS:
@@ -200,13 +216,14 @@ def _unbacked_readback(text: str, history: list) -> bool:
     the reply sailed through as grounded. Silent loss of exactly the item the
     user could not verify by memory.
 
-    Only armed when a write tool ran. With no write this turn, a flat list is
-    almost certainly a query_entries readback, and demanding database backing
-    for it would re-break the legitimate answer fixed on 2026-08-27.
+    Only armed when a row was INSERTED this turn. With no insert, a flat list
+    is a query_entries readback or the meal re-read after an update_entry
+    correction, and demanding database backing for it would re-break the
+    legitimate answer fixed on 2026-08-27.
     """
-    written = _values_written_this_turn(history)
-    if not written:
+    if not (_tools_run_this_turn(history) & _INSERT_TOOLS):
         return False
+    written = _values_written(history)
     for raw in _READBACK_VALUE_RE.findall(text):
         claimed = _as_number(raw)
         if claimed is not None and claimed not in written:
@@ -291,18 +308,21 @@ def _fabrication_reason(response, history: list) -> str | None:
         return None
     if _NARRATED_CALL_RE.search(text):
         return "narrated a tool call in prose"
+    tools_run = _tools_run_this_turn(history)
+    about_log = bool(_LOG_DOMAIN_RE.search(text)) or bool(tools_run & _LOG_DB_TOOLS)
     # Any tool actually ran this turn => the reply is grounded in a real result,
     # so leave it alone. Requiring a *write* tool specifically was too strict: a
     # legitimate query readback ("You logged 1050 for rice and 240 for tofu,
     # 1290 total") says "logged" about rows query_entries really returned, and
     # got blocked. The fabrication this guards against emits a confirmation with
     # no tool call at all.
-    if _CLAIMS_WRITE_RE.search(text) and not (_tools_run_this_turn(history) & _LOG_DB_TOOLS):
+    if about_log and _CLAIMS_WRITE_RE.search(text) and not (tools_run & _LOG_DB_TOOLS):
         return "claimed a write that no tool performed"
     # A row id the reply cites that no tool ever returned is invented. On
     # 2026-09-22 query_entries returned Sept 20 only, and the model made up
     # rows #419-#426 for Sept 21 and 22, with totals, and spoke them as fact.
-    if set(_ROW_ID_RE.findall(text)) - _ids_the_model_has_seen(history):
+    # Gated on the log: "the #1 song right now" is not a row id.
+    if about_log and set(_ROW_ID_RE.findall(text)) - _ids_the_model_has_seen(history):
         return "cited log rows no tool returned"
     # A write DID run, but the reply claims more than it wrote. Checked after
     # the all-or-nothing case above so the fully-fabricated turn keeps its own
@@ -311,10 +331,10 @@ def _fabrication_reason(response, history: list) -> str | None:
         return "read back items no tool wrote"
     # A removal is checked against removal tools specifically: other tools
     # running that turn (a log_entry alongside it) say nothing about whether
-    # anything was actually deleted.
-    if _CLAIMS_DELETE_RE.search(text) and not (
-        _tools_run_this_turn(history) & _DESTRUCTIVE_TOOLS
-    ):
+    # anything was actually deleted. Any removal counts — "Deleted it." after
+    # delete_calendar_event is true, and was being answered with "nothing was
+    # deleted" while the event was already gone.
+    if _CLAIMS_DELETE_RE.search(text) and not (tools_run & _REMOVAL_TOOLS):
         return "claimed a deletion that no tool performed"
     return None
 
@@ -327,6 +347,12 @@ _ID_TARGETED_TOOLS = {"delete_entry", "update_entry"}
 # id, so it needs no id check — but a "I removed it" claim must still be backed
 # by one of these having run.
 _DESTRUCTIVE_TOOLS = {"delete_entry", "update_entry", "delete_entries"}
+
+# Anything that can truthfully back "deleted/removed/cleared it".
+_REMOVAL_TOOLS = _DESTRUCTIVE_TOOLS | {
+    "delete_calendar_event", "cancel_timer", "remove_from_doordash_cart",
+    "cancel_doordash_order", "mark_discord_read",
+}
 
 # Row ids are surfaced as "#331" by log_entry/log_meal/query_entries.
 _ROW_ID_RE = re.compile(r"#(\d+)")
