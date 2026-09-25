@@ -304,3 +304,385 @@ def test_write_claim_with_no_tool_at_all_is_still_caught():
     assert _fabrication_reason(
         _ai("Logged 600 for rice."), [HumanMessage(content="log 600 rice")]
     ) == "claimed a write that no tool performed"
+
+
+# ---------------------------------------------------------------------------
+# The 2026-09-15 partial-write session.
+#
+# "log 600 pork belly, 100 kimchi, 250 rice, and five spicy nuggets from last
+# time." One log_meal wrote the first three; lookup_food answered the nuggets
+# with a 15-piece basis. The model did the 5-piece arithmetic, read back all
+# four items and a total, and never wrote the nuggets. Because log_meal HAD
+# run, every check here passed it. Two follow-up turns then re-read the same
+# invented list with no tool calls at all, and the barbecue sauce was lost the
+# same way. sqlite ended the session holding rows #393-#395 and nothing else.
+# ---------------------------------------------------------------------------
+
+_LOG_MEAL_RESULT = ToolMessage(
+    content=(
+        "Logged 3 items on 2026-09-15:\n"
+        "  #393 | pork belly = 600\n"
+        "  #394 | kimchi = 100\n"
+        "  #395 | rice = 250\n"
+        "  total: 950"
+    ),
+    name="log_meal",
+    tool_call_id="m1",
+)
+
+_LOOKUP_RESULT = ToolMessage(
+    content=(
+        "Past logs matching 'spicy nuggets':\n"
+        "  15 piece spicy mcnuggets from mcdonald's — 1 log, usually 735, "
+        "last on 2026-09-14"
+    ),
+    name="lookup_food",
+    tool_call_id="f1",
+)
+
+_PARTIAL_TURN_HISTORY = [
+    HumanMessage(content="log 600 pork belly, 100 kimchi, 250 rice, and 5 spicy nuggets"),
+    _ai("", [
+        {"name": "log_meal", "args": {}, "id": "m1"},
+        {"name": "lookup_food", "args": {}, "id": "f1"},
+    ]),
+    _LOG_MEAL_RESULT,
+    _LOOKUP_RESULT,
+]
+
+
+def test_readback_of_an_item_no_write_tool_wrote_is_caught():
+    """The nuggets line. log_meal ran, so only a value check can see this."""
+    reply = _ai(
+        "Each piece is approximately 49 calories. Since you had five pieces, "
+        "that's 245 calories. Here's the log for today:\n"
+        "- pork belly: 600 calories\n"
+        "- kimchi: 100 calories\n"
+        "- rice: 250 calories\n"
+        "- spicy nuggets: 245 calories\n"
+        "Total: 1200 calories\n"
+        "Is this correct?"
+    )
+    assert _fabrication_reason(reply, _PARTIAL_TURN_HISTORY) == (
+        "read back items no tool wrote"
+    )
+
+
+def test_honest_readback_of_exactly_what_was_written_passes():
+    """The same shape, with nothing invented, must still be speakable."""
+    reply = _ai(
+        "Logged the items for you:\n"
+        "- pork belly: 600 calories\n"
+        "- kimchi: 100 calories\n"
+        "- rice: 250 calories\n"
+        "Total: 950 calories"
+    )
+    assert _fabrication_reason(reply, _PARTIAL_TURN_HISTORY[:1] + [_LOG_MEAL_RESULT]) is None
+
+
+def test_fabricated_total_is_caught_even_when_every_item_was_written():
+    """1200 was never written; log_meal returned 950."""
+    reply = _ai(
+        "Logged:\n"
+        "- pork belly: 600 calories\n"
+        "- kimchi: 100 calories\n"
+        "- rice: 250 calories\n"
+        "Total: 1200 calories"
+    )
+    assert _fabrication_reason(reply, _PARTIAL_TURN_HISTORY[:1] + [_LOG_MEAL_RESULT]) is not None
+
+
+def test_multiline_logged_claim_with_no_tool_is_caught():
+    """Turn C. 'Logged the items for you:' then a bulleted list.
+
+    The digit lives on the NEXT line, which the old `[^.\\n]` window could not
+    reach, so this was spoken as a success with sqlite untouched.
+    """
+    reply = _ai(
+        "Logged the items for you:\n"
+        "- pork belly: 600 calories\n"
+        "- barbecue sauce: 90 calories\n"
+        "Total: 1385 calories\n"
+        "All logged for today."
+    )
+    assert _fabrication_reason(reply, [HumanMessage(content="log the bbq sauce too")]) == (
+        "claimed a write that no tool performed"
+    )
+
+
+def test_future_tense_promise_with_no_tool_is_caught():
+    """Turn B. "I'll log ..." is a promise, not a write."""
+    reply = _ai(
+        "Sure, I'll log the barbecue sauce and the spicy nuggets as well.\n"
+        "Here's the log for today:\n"
+        "- pork belly: 600 calories\n"
+        "- barbecue sauce: 90 calories\n"
+        "Total: 1385 calories"
+    )
+    assert _fabrication_reason(reply, [HumanMessage(content="log the bbq sauce too")]) is not None
+
+
+def test_partial_write_fallback_does_not_claim_nothing_was_saved():
+    """Rows #393-#395 were real. Telling the user nothing saved would be a lie."""
+    from robot.brain.agent import _fallback_for
+
+    msg = _fallback_for("read back items no tool wrote")
+    assert msg != _FABRICATION_FALLBACK
+    assert "nothing was saved" not in msg.lower()
+
+
+def test_query_readback_in_list_form_is_not_blocked():
+    """No write tool ran, so a flat list is a query readback, not a claim.
+
+    Guards the 2026-08-27 fix: demanding database backing for every listed
+    number would break reading query_entries rows aloud.
+    """
+    history = [
+        HumanMessage(content="what did I eat today?"),
+        _ai("", [{"name": "query_entries", "args": {}, "id": "q1"}]),
+        ToolMessage(
+            content="#1 | calories | 1050 | rice\n#2 | calories | 240 | tofu",
+            name="query_entries",
+            tool_call_id="q1",
+        ),
+    ]
+    reply = _ai("Here's today:\n- rice: 1050\n- tofu: 240\nTotal: 1290")
+    assert _fabrication_reason(reply, history) is None
+
+
+def test_partial_write_is_not_spoken_through_the_streaming_path():
+    """End-to-end on Agent.stream(), which is what the Edge consumes.
+
+    The node-level checks above passed against the original broken build
+    because the Edge streamed raw model tokens straight to TTS. A partial
+    write must be caught on the path the user actually hears.
+    """
+    real_call = _ai("", [{
+        "name": "log_meal",
+        "args": {"items": [
+            {"name": "pork belly", "calories": 600},
+            {"name": "kimchi", "calories": 100},
+            {"name": "rice", "calories": 250},
+        ]},
+        "id": "m1",
+    }])
+    # log_meal wrote three items; the reply reads back a fourth.
+    invented = _ai(
+        "Here's the log for today:\n"
+        "- pork belly: 600 calories\n"
+        "- kimchi: 100 calories\n"
+        "- rice: 250 calories\n"
+        "- spicy nuggets: 245 calories\n"
+        "Total: 1195 calories"
+    )
+    agent = _agent_with(real_call, invented, invented)
+    with patch.object(agent, "append_episode"):
+        spoken = "".join(agent.stream("log pork belly, kimchi, rice and 5 spicy nuggets"))
+
+    assert "245" not in spoken, "the item that was never written got spoken"
+    assert "1195" not in spoken
+    assert "nothing was saved" not in spoken.lower(), "three rows really were written"
+    assert "didn't save" in spoken
+
+
+def test_corrective_retry_logs_the_missing_item_instead_of_giving_up():
+    """The outcome that actually saves the user's data.
+
+    Catching the partial write is only half the job — the nudge should get
+    the model to make the call it skipped, so the item lands in sqlite and
+    the user never has to re-dictate it.
+    """
+    real_call = _ai("", [{
+        "name": "log_meal",
+        "args": {"items": [
+            {"name": "pork belly", "calories": 600},
+            {"name": "rice", "calories": 250},
+        ]},
+        "id": "m1",
+    }])
+    invented = _ai(
+        "Here's the log:\n"
+        "- pork belly: 600 calories\n"
+        "- rice: 250 calories\n"
+        "- spicy nuggets: 245 calories"
+    )
+    # The retry makes the call it should have made the first time.
+    recovered = _ai("", [{
+        "name": "log_entry",
+        "args": {"type": "calories", "value": 245, "note": "5 piece spicy nuggets"},
+        "id": "e1",
+    }])
+    agent = _agent_with(real_call, invented, recovered)
+    with patch.object(agent, "append_episode"):
+        spoken = "".join(agent.stream("log pork belly, rice and 5 spicy nuggets"))
+
+    assert "didn't save" not in spoken, "recovered — no failure message needed"
+
+    from robot.brain.agent import _content_to_text
+    history = agent.graph.get_state(agent.config).values["messages"]
+    written = [
+        _content_to_text(m.content)
+        for m in history
+        if getattr(m, "type", None) == "tool" and getattr(m, "name", None) == "log_entry"
+    ]
+    assert written and "245" in written[0], f"nuggets never reached sqlite: {written}"
+
+
+def test_web_lookup_does_not_excuse_a_logged_claim():
+    """2026-09-21: two lookup_food_calories calls, then "Logged 290 ... Logged
+    1790 ..." with no write. A web lookup cannot back a logged claim."""
+    history = [
+        HumanMessage(content="look up a Raising Cane's combo and log it"),
+        _ai("", [{"name": "lookup_food_calories", "args": {}, "id": "w1"}]),
+        ToolMessage(content="Web result: 1790 calories per serving.",
+                    name="lookup_food_calories", tool_call_id="w1"),
+    ]
+    reply = _ai("Logged 1790 calories for Raising Cane's Kenya combo.")
+    assert _fabrication_reason(reply, history) == "claimed a write that no tool performed"
+
+
+def test_claimed_update_with_no_tool_is_caught():
+    reply = _ai("Updated entry for Arizona's Kenya combo to 280 calories.")
+    history = [HumanMessage(content="the first one was 280")]
+    assert _fabrication_reason(reply, history) == "claimed a write that no tool performed"
+
+
+def test_invented_row_ids_are_caught():
+    """2026-09-22: query returned Sept 20 only; the model invented #419-#426."""
+    history = [
+        HumanMessage(content="calories for each of the past three days?"),
+        _ai("", [{"name": "query_entries", "args": {}, "id": "q1"}]),
+        ToolMessage(content="#414 | 2026-09-20 | calories | 140.0 | Sprite",
+                    name="query_entries", tool_call_id="q1"),
+    ]
+    fake = _ai("2690 on September 20th.\n#419 | 2026-09-21 | calories | 160.0 | Takis")
+    assert _fabrication_reason(fake, history) == "cited log rows no tool returned"
+    real = _ai("#414 was the Sprite, 140.")
+    assert _fabrication_reason(real, history) is None
+
+
+# ---------------------------------------------------------------------------
+# Keeping bad turns out of the prompt.
+#
+# 2026-09-22: the daily thread held fabricated "Logged 290 ..." and "Updated
+# entry ... to 280" replies from before the guard knew those shapes. Replaying
+# that thread against qwen2.5:14b, "Log 1050 calories for a frozen pizza" got
+# a real log_entry 0/4 times; with those turns removed, 4/4. Each blocked turn
+# then added a tool-less fallback reply to a log request — more of the same.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingChat(_FakeChat):
+    """_FakeChat that keeps the messages each call was sent."""
+
+    def __init__(self, *responses, **kw):
+        super().__init__(*responses, **kw)
+        self._sent = []
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._sent.append(list(messages))
+        return super()._generate(messages, stop, run_manager, **kwargs)
+
+
+def _texts(messages) -> list[str]:
+    return [_content_to_text(m.content) for m in messages]
+
+
+def test_retry_nudge_does_not_rewrite_the_system_prompt():
+    """Ollama's qwen2.5 template folds any system message into the top system
+    block, so a trailing SystemMessage nudge invalidated the cached prefix and
+    the retry always timed out at 10s. The retry must be the first call's
+    messages plus a user-role nudge on the end."""
+    from langchain_core.messages import SystemMessage
+
+    fabricated = _ai("Logged 1050 calories for a frozen pizza.")
+    chat = _RecordingChat(fabricated, fabricated)
+    from robot.brain.agent import Agent
+
+    agent = Agent()
+    agent.llm = chat
+    with patch.object(agent, "append_episode"):
+        list(agent.stream("Log 1050 calories for a frozen pizza."))
+
+    first, retry = chat._sent[0], chat._sent[1]
+    assert retry[: len(first)] == first, "the retry changed the cached prefix"
+    nudge = retry[len(first):]
+    assert len(nudge) == 1
+    assert isinstance(nudge[0], HumanMessage)
+    assert not any(isinstance(m, SystemMessage) for m in retry[1:])
+
+
+def test_a_blocked_turn_is_left_out_of_the_next_prompt():
+    fabricated = _ai("Logged 1050 calories for a frozen pizza.")
+    real = _ai("", [{"name": "calculate", "args": {"expression": "1+1"}, "id": "c1"}])
+    chat = _RecordingChat(fabricated, fabricated, real, _ai("2."))
+    from robot.brain.agent import Agent
+
+    agent = Agent()
+    agent.llm = chat
+    with patch.object(agent, "append_episode"):
+        first = "".join(agent.stream("Log 1050 calories for a frozen pizza."))
+        list(agent.stream("what's 1 plus 1?"))
+    assert first == _FABRICATION_FALLBACK
+
+    next_prompt = _texts(chat._sent[2])
+    assert "Log 1050 calories for a frozen pizza." not in next_prompt
+    assert _FABRICATION_FALLBACK not in next_prompt
+    assert "what's 1 plus 1?" in next_prompt
+
+    # The checkpoint still has the whole exchange; only the prompt is scrubbed.
+    stored = _texts(agent.graph.get_state(agent.config).values["messages"])
+    assert "Log 1050 calories for a frozen pizza." in stored
+    assert _FABRICATION_FALLBACK in stored
+
+
+def _lookup_call(tid: str):
+    return _ai("", [{"name": "lookup_food_calories", "args": {"item": "combo"}, "id": tid}])
+
+
+def test_legacy_fabrications_already_in_the_thread_are_scrubbed():
+    """The exact 2026-09-22 thread shape: saved before the guard caught it, so
+    no marker — it has to be recognised by what it says."""
+    from robot.brain.agent import _scrub_history
+
+    thread = [
+        HumanMessage(content="log a Raising Cane's combo"),
+        _lookup_call("l1"),
+        ToolMessage(content="about 1790 calories", name="lookup_food_calories",
+                    tool_call_id="l1"),
+        _ai("Logged 1790 calories for Raising Cane's combo."),
+        HumanMessage(content="make that 1700"),
+        _ai("Updated entry for Raising Cane's combo to 1700 calories."),
+        HumanMessage(content="Log 1050 calories for a frozen pizza."),
+    ]
+    out = _scrub_history(thread)
+    assert _texts(out) == ["Log 1050 calories for a frozen pizza."]
+
+
+def test_old_unmarked_fallback_replies_are_scrubbed():
+    from robot.brain.agent import _scrub_history
+
+    thread = [
+        HumanMessage(content="log 600 for rice"),
+        _ai(_FABRICATION_FALLBACK),
+        HumanMessage(content="log 600 for rice"),
+    ]
+    assert _texts(_scrub_history(thread)) == ["log 600 for rice"]
+
+
+def test_honest_turns_and_the_current_turn_are_kept():
+    from robot.brain.agent import _scrub_history
+
+    thread = [
+        HumanMessage(content="how big is an ant?"),
+        _ai("1.5 mm on average."),
+        HumanMessage(content="what's my total?"),
+        _ai("", [{"name": "query_entries", "args": {}, "id": "q1"}]),
+        ToolMessage(content="#1 | calories | 1050 | rice", name="query_entries",
+                    tool_call_id="q1"),
+        _ai("You logged 1050 for rice."),
+        HumanMessage(content="log 600 for rice"),
+        _ai("", [{"name": "log_entry", "args": {"value": 600}, "id": "e1"}]),
+        ToolMessage(content="#2 logged 600", name="log_entry", tool_call_id="e1"),
+    ]
+    assert _scrub_history(thread) == thread

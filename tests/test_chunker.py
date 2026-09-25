@@ -209,3 +209,23 @@ def test_chunks_still_join_without_losing_spaces():
     chunks = ["Logged 250. ", "Anything else?"]
     joined = "".join(sanitize_for_speech(c) for c in chunks)
     assert joined == "Logged 250. Anything else?"
+
+
+def test_sanitize_drops_echoed_query_entries_lines():
+    """2026-09-22: the model read every tool row and the TOTAL instruction aloud."""
+    for line in [
+        "#414 | 2026-09-20 | calories | 140.0 | Sprite\n",
+        "TOTAL calories: 2690 across 4 entries — read this number back exactly, do ",
+        "not re-add the rows\n",
+        "PER-DAY TOTALS (answer from these; don't read the rows above aloud):\n",
+    ]:
+        assert sanitize_for_speech(line) == ""
+
+
+def test_sanitize_spells_iso_dates():
+    from datetime import date
+
+    year = date.today().year
+    assert sanitize_for_speech(f"On {year}-09-20 you had 2690.") == "On September 20 you had 2690."
+    assert sanitize_for_speech("Back on 2019-01-05.") == "Back on January 5, 2019."
+    assert sanitize_for_speech("Not a date: 2026-13-45.") == "Not a date: 2026-13-45."

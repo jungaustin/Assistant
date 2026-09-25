@@ -53,7 +53,8 @@ def test_log_entry_returns_id_update_entry_can_target(tmp_path: Path):
     assert db.query_entries(type="calories") == "[]"  # gone from today
     moved = db.query_entries(type="calories", start_date="2026-08-09", end_date="2026-08-09")
     assert "Takis" in moved
-    assert len(moved.splitlines()) == 1  # moved, not duplicated
+    # Count data rows, not lines: query_entries now appends a TOTAL line.
+    assert sum(l.startswith('#') for l in moved.splitlines()) == 1  # moved, not duplicated
     db.close()
 
 
@@ -324,7 +325,7 @@ def test_log_meal_inserts_one_row_per_item(tmp_path: Path):
     rows = db.query_entries(type="calories", start_date="2026-06-05", end_date="2026-06-05")
     assert "orange chicken" in rows
     assert "chow mein" in rows
-    assert len(rows.splitlines()) == 2
+    assert sum(l.startswith('#') for l in rows.splitlines()) == 2  # rows, not the TOTAL line
     db.close()
 
 
@@ -512,4 +513,70 @@ def test_delete_entry_no_match(tmp_path: Path):
     db = _db(tmp_path)
     result = db.delete_entry()
     assert "No matching entry" in result
+    db.close()
+
+
+# --- query_entries hands the model the sum ----------------------------------
+
+
+def test_query_entries_includes_an_exact_total(tmp_path):
+    """2026-09-15: all five Sept 14 rows came back correctly and the model still
+    announced 1805 — twice — for a day totalling 2345. The sum is computed here
+    so the model never adds rows itself."""
+    db = TrackerDB(str(tmp_path / "t.db"))
+    for v, note in [(600, "2 adobada tacos"), (735, "15 piece spicy McNuggets"),
+                    (180, "two barbecue sauces"), (500, "ramen"), (330, "brisket")]:
+        db.log_entry(type="calories", value=v, note=note, entry_date="2026-09-14")
+    out = db.query_entries(type="calories", start_date="2026-09-14", end_date="2026-09-14")
+    assert "TOTAL calories: 2345 across 5 entries" in out
+
+
+def test_totals_are_per_type_and_skip_valueless_rows(tmp_path):
+    db = TrackerDB(str(tmp_path / "t.db"))
+    db.log_entry(type="calories", value=400, entry_date="2026-09-14")
+    db.log_entry(type="calories", value=250.5, entry_date="2026-09-14")
+    db.log_entry(type="sleep", value=7, entry_date="2026-09-14")
+    db.log_entry(type="exercise", note="5k run", entry_date="2026-09-14")  # no value
+    out = db.query_entries(start_date="2026-09-14", end_date="2026-09-14")
+    assert "TOTAL calories: 650.5 across 2 entries" in out
+    assert "TOTAL sleep: 7 across 1 entry" in out
+    assert "TOTAL exercise" not in out
+
+
+def test_total_line_cannot_be_mistaken_for_a_row_id(tmp_path):
+    """The destructive-call guard trusts '#N' in tool output as a real row id.
+    A total like 2345 must never become a deletable id."""
+    from robot.brain.agent import _ROW_ID_RE
+
+    db = TrackerDB(str(tmp_path / "t.db"))
+    db.log_entry(type="calories", value=2345, entry_date="2026-09-14")
+    out = db.query_entries(type="calories", start_date="2026-09-14", end_date="2026-09-14")
+    total_line = [l for l in out.splitlines() if l.startswith("TOTAL")][0]
+    assert _ROW_ID_RE.findall(total_line) == []
+
+
+def test_empty_query_still_returns_empty_marker(tmp_path):
+    db = TrackerDB(str(tmp_path / "t.db"))
+    assert db.query_entries(type="calories", start_date="2020-01-01", end_date="2020-01-01") == "[]"
+
+
+def test_query_entries_multi_day_lists_every_day_including_empty(tmp_path: Path):
+    """2026-09-22: rows came back for Sept 20 only and the model invented
+    Sept 21 and 22. Every day in range gets a line, empty days said outright."""
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=140, note="Sprite", entry_date="2026-09-20")
+    db.log_entry(type="calories", value=1960, note="Panda", entry_date="2026-09-20")
+
+    result = db.query_entries(type="calories", start_date="2026-09-20", end_date="2026-09-22")
+    assert "Sunday September 20: 2100 calories" in result
+    assert "Monday September 21: nothing logged — no calories" in result
+    assert "Tuesday September 22: nothing logged — no calories" in result
+    db.close()
+
+
+def test_query_entries_single_day_has_no_per_day_block(tmp_path: Path):
+    db = _db(tmp_path)
+    db.log_entry(type="calories", value=500, entry_date="2026-06-05")
+    result = db.query_entries(type="calories", start_date="2026-06-05", end_date="2026-06-05")
+    assert "PER-DAY" not in result
     db.close()

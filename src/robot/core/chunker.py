@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date
 from typing import AsyncIterator, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
@@ -55,15 +56,45 @@ _DOUBLE_SPACE = re.compile(r"  +")
 # dropped. Emoji go too — espeak reads those by name as well.
 _UNSPEAKABLE = re.compile(r"[^\u0000-\u024F\u2010-\u2027\u2030-\u205E]+")
 
+# Tool-output lines the model sometimes echoes verbatim instead of summarizing
+# (2026-09-22: a calorie question spoke every "#414 | 2026-09-20 | calories |
+# ..." row and the "TOTAL ... do not re-add the rows" instruction). Chunks
+# split on newlines, so each echoed line arrives as its own chunk and can be
+# dropped whole. The TOTAL line runs past MAX_CHARS and gets force-split, so
+# its tail is matched by its wording too.
+_TOOL_ECHO = re.compile(
+    r"^\s*(#\d+\s*\||TOTAL \w+:|PER-DAY TOTALS)|read this number back|re-add the rows"
+)
+
+# ISO dates: TTS reads "2026-09-20" as "two zero two six dash zero nine dash
+# two zero". Spell them as "September 20", keeping the year only when it isn't
+# this year.
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _speak_date(m: re.Match) -> str:
+    try:
+        d = date(int(m[1]), int(m[2]), int(m[3]))
+    except ValueError:
+        return m[0]
+    spoken = f"{d:%B} {d.day}"
+    return spoken if d.year == date.today().year else f"{spoken}, {d.year}"
+
 
 def sanitize_for_speech(text: str) -> str:
     """Strip spoken-markup noise (``*``, ``` ` ```) from a chunk bound for TTS.
+
+    Also drops echoed query_entries lines and spells ISO dates as words.
 
     Cheap enough to run on every chunk in the streaming path — a regex sub on
     an ~80-char string — so it never delays audio. Collapses the double space a
     removed inline marker can leave (``foo **bar**`` mid-word markers don't, but
     `` ** `` as a standalone token would).
     """
+    if _TOOL_ECHO.search(text):
+        logger.warning("dropped echoed tool output from TTS chunk: %r", text)
+        return ""
+    text = _ISO_DATE.sub(_speak_date, text)
     text = _SPEECH_NOISE.sub("", text)
     if _UNSPEAKABLE.search(text):
         # Log rather than swallow silently: the audio is now sane, but a model

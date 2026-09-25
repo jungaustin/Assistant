@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -225,14 +225,61 @@ class TrackerDB:
             return "[]"
 
         lines = []
+        totals: dict[str, list[float]] = {}
         for eid, entry_date, etype, val, note in rows:
             # Lead with '#id' so update_entry / delete_entry can target a row.
             parts = [f"#{eid}", entry_date, etype]
             if val is not None:
                 parts.append(str(val))
+                totals.setdefault(etype, []).append(val)
             if note:
                 parts.append(note)
             lines.append(" | ".join(parts))
+
+        # Hand the model the sum instead of letting it add the rows itself. On
+        # 2026-09-15 it read back all five rows for Sept 14 correctly and then
+        # announced 1805 — twice — for a day that totals 2345. It cannot do
+        # reliable mental arithmetic, and a single-day total slipped past the
+        # persona's "use entry_stats for totals" rule, which only covered
+        # multi-day ranges. No '#' here: the id guard reads '#N' as a row id.
+        for etype, vals in totals.items():
+            total = sum(vals)
+            shown = int(total) if float(total).is_integer() else round(total, 2)
+            lines.append(
+                f"TOTAL {etype}: {shown} across {len(vals)} "
+                f"entr{'y' if len(vals) == 1 else 'ies'} — read this number back "
+                "exactly, do not re-add the rows"
+            )
+
+        # Multi-day ranges also get one line per calendar day, empty days
+        # included. On 2026-09-22 "calories for each of the past three days"
+        # returned rows for Sept 20 only; the model then invented rows #419-#426
+        # and totals for Sept 21 and 22, copying Sept 20's foods. An explicit
+        # "nothing logged" line leaves no gap to fill. Dates are spelled out
+        # because TTS reads "2026-09-20" digit by digit.
+        d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
+        if d1 > d0:
+            by_day: dict[str, dict[str, list[float]]] = {}
+            for _, entry_date, etype, val, _ in rows:
+                if val is not None:
+                    by_day.setdefault(entry_date, {}).setdefault(etype, []).append(val)
+            what = type.strip().lower() if type else "entries"
+            lines.append("PER-DAY TOTALS (answer from these; don't read the rows above aloud):")
+            span = (d1 - d0).days + 1
+            for i in range(span):
+                d = d0 + timedelta(days=i)
+                day_totals = by_day.get(d.isoformat())
+                if not day_totals and span > 31:
+                    continue  # long ranges: skip empty days to keep this short
+                label = f"{d:%A} {d:%B} {d.day}"
+                if not day_totals:
+                    lines.append(f"{label}: nothing logged — no {what}")
+                    continue
+                parts = []
+                for etype, vals in day_totals.items():
+                    t = sum(vals)
+                    parts.append(f"{int(t) if float(t).is_integer() else round(t, 2)} {etype}")
+                lines.append(f"{label}: " + ", ".join(parts))
         return "\n".join(lines)
 
     def entry_stats(
@@ -694,7 +741,9 @@ class LogTools:
                 "  start_date (str, optional): ISO date YYYY-MM-DD. Defaults to today.\n"
                 "  end_date (str, optional): ISO date YYYY-MM-DD. Defaults to today.\n\n"
                 "Returns a newline-joined table of entries in the format "
-                "'date | type | value | note', or '[]' if nothing was logged. "
+                "'#id | date | type | value | note', or '[]' if nothing was logged. "
+                "Multi-day ranges end with PER-DAY TOTALS, one line per day; a day "
+                "marked 'nothing logged' has NO entries — say so, never invent any. "
                 "Summarize the results conversationally — don't read the raw table aloud.\n\n"
                 "For totals, averages, or day counts spanning MORE THAN ONE DAY, do "
                 "not use this tool and add rows up yourself — call entry_stats "

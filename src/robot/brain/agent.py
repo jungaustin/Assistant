@@ -113,8 +113,31 @@ _NARRATED_CALL_RE = re.compile(
 
 # "Logged 600 for rice." — a write claim carrying a number. Requiring the digit
 # keeps this off ordinary prose ("I moved it", "saved you a step").
+#
+# The gap between the verb and the digit must be able to cross a NEWLINE. The
+# persona (nemo.md) mandates the readback be "a flat list, one item per line",
+# so the real shape is a claim line followed by bullets:
+#
+#     Logged the items for you:
+#     - pork belly: 600
+#
+# The old `[^.\n]` could not reach past the first newline, so on 2026-09-15 two
+# fabricated confirmations in that exact shape were spoken as success. The '.'
+# exclusion still stops the match crossing a sentence boundary, which is what
+# keeps "Saved you a step." off the digits in the next sentence.
+#
+# Non-past tense counts too: "I'll log the barbecue sauce" with zero tool calls
+# is a promise that nothing kept. This regex is only ever consulted when the
+# reply made NO tool call, so a bare "log" cannot fire on a legitimate readback
+# of a tool that actually ran.
+#
+# "Updated entry for Arizona's Kenya combo to 280 calories." was spoken on
+# 2026-09-21 with no tool call at all — edit verbs were missing from this list.
 _CLAIMS_WRITE_RE = re.compile(
-    r"\b(logged|recorded|saved)\b[^.\n]{0,40}?\d", re.IGNORECASE
+    r"\b(log|logged|logging|record|recorded|recording|save|saved|saving|added"
+    r"|update|updated|updating|changed|corrected|fixed)"
+    r"\b[^.]{0,60}?\d",
+    re.IGNORECASE,
 )
 
 # "Deleted today's entries." — said on 2026-09-01 about a delete the guessed-id
@@ -126,6 +149,70 @@ _CLAIMS_DELETE_RE = re.compile(
     r"\b(entry|entries|row|rows|log|logs|one|ones|it|them)\b",
     re.IGNORECASE,
 )
+
+# A readback line from the persona-mandated flat list: "- spicy nuggets: 245",
+# "rice = 250", "Total: 1385". The value is what we check against the database.
+_READBACK_VALUE_RE = re.compile(
+    r"^[ \t]*[-*\u2022]?[ \t]*[^\n:=]{1,60}?[:=][ \t]*([\d,]+(?:\.\d+)?)",
+    re.MULTILINE,
+)
+
+# Row ids ("#393") and ISO dates ("2026-09-15") appear in write-tool output but
+# are not values the user logged. Stripping them keeps an id from accidentally
+# vouching for a calorie count that was never written.
+_TOOL_NOISE_RE = re.compile(r"#\d+|\d{4}-\d{2}-\d{2}")
+_NUMBER_RE = re.compile(r"[\d,]+(?:\.\d+)?")
+
+
+def _as_number(raw: str):
+    try:
+        return float(raw.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _values_written_this_turn(history: list) -> set[float]:
+    """Every number a write tool actually returned since the last user message."""
+    values: set[float] = set()
+    for msg in reversed(history):
+        if getattr(msg, "type", None) == "human":
+            break
+        if getattr(msg, "type", None) != "tool":
+            continue
+        if getattr(msg, "name", None) not in _WRITE_TOOLS:
+            continue
+        text = _TOOL_NOISE_RE.sub(" ", _content_to_text(getattr(msg, "content", None)))
+        for raw in _NUMBER_RE.findall(text):
+            n = _as_number(raw)
+            if n is not None:
+                values.add(n)
+    return values
+
+
+def _unbacked_readback(text: str, history: list) -> bool:
+    """Does the reply read back an item the write tools never wrote?
+
+    The failure this catches is a PARTIAL write, which every other check here
+    is blind to. On 2026-09-15 the model logged pork belly, kimchi and rice in
+    one log_meal, called lookup_food for the nuggets, then read back all four
+    items plus a total — and the nuggets and the total had never touched
+    sqlite. A write tool HAD run, so `_tools_run_this_turn` was non-empty and
+    the reply sailed through as grounded. Silent loss of exactly the item the
+    user could not verify by memory.
+
+    Only armed when a write tool ran. With no write this turn, a flat list is
+    almost certainly a query_entries readback, and demanding database backing
+    for it would re-break the legitimate answer fixed on 2026-08-27.
+    """
+    written = _values_written_this_turn(history)
+    if not written:
+        return False
+    for raw in _READBACK_VALUE_RE.findall(text):
+        claimed = _as_number(raw)
+        if claimed is not None and claimed not in written:
+            return True
+    return False
+
 
 _FABRICATION_NUDGE = (
     "Your last reply described a tool call in words instead of making one. "
@@ -143,6 +230,15 @@ _FABRICATION_FALLBACK = "Sorry — that didn't go through. Nothing was saved. As
 # the generic "nothing was saved" line above would be untrue in the one
 # direction that matters. Keep each message to what actually failed.
 _FABRICATION_FALLBACKS = {
+    # A partial write already put SOME rows in the database, so the generic
+    # "nothing was saved" would send the user looking for data that is there.
+    # Point them at the log instead of naming numbers we no longer trust.
+    "read back items no tool wrote":
+        "Sorry — part of that didn't save. Ask me what's logged today and "
+        "I'll read it straight from the database.",
+    "cited log rows no tool returned":
+        "Sorry — I got the log mixed up. Ask me again and I'll read it "
+        "straight from the database.",
     "claimed a deletion that no tool performed":
         "Sorry — I couldn't remove that, so nothing was deleted. "
         "Ask me to check what's logged and I'll remove it by number.",
@@ -151,6 +247,22 @@ _FABRICATION_FALLBACKS = {
 
 def _fallback_for(reason: str) -> str:
     return _FABRICATION_FALLBACKS.get(reason, _FABRICATION_FALLBACK)
+
+
+# Set on a reply the guard replaced with a fallback, so later turns can leave
+# that exchange out of the prompt (see _scrub_history).
+_BLOCKED_MARKER = "fabrication_blocked"
+_FALLBACK_TEXTS = {_FABRICATION_FALLBACK, *_FABRICATION_FALLBACKS.values()}
+
+
+# Tools whose output can back a "logged N" sentence: they write the log or
+# read it back. A web calorie lookup cannot. On 2026-09-21 the model ran
+# lookup_food_calories twice, then said "Logged 290 ... Logged 1790 ..." with
+# no write — and because *a* tool had run, the claim was waved through and
+# the meal was silently lost.
+_LOG_DB_TOOLS = _WRITE_TOOLS | {
+    "delete_entry", "delete_entries", "query_entries", "entry_stats", "lookup_food",
+}
 
 
 def _tools_run_this_turn(history: list) -> set[str]:
@@ -185,8 +297,18 @@ def _fabrication_reason(response, history: list) -> str | None:
     # 1290 total") says "logged" about rows query_entries really returned, and
     # got blocked. The fabrication this guards against emits a confirmation with
     # no tool call at all.
-    if _CLAIMS_WRITE_RE.search(text) and not _tools_run_this_turn(history):
+    if _CLAIMS_WRITE_RE.search(text) and not (_tools_run_this_turn(history) & _LOG_DB_TOOLS):
         return "claimed a write that no tool performed"
+    # A row id the reply cites that no tool ever returned is invented. On
+    # 2026-09-22 query_entries returned Sept 20 only, and the model made up
+    # rows #419-#426 for Sept 21 and 22, with totals, and spoke them as fact.
+    if set(_ROW_ID_RE.findall(text)) - _ids_the_model_has_seen(history):
+        return "cited log rows no tool returned"
+    # A write DID run, but the reply claims more than it wrote. Checked after
+    # the all-or-nothing case above so the fully-fabricated turn keeps its own
+    # (blunter, and accurate) "nothing was saved" message.
+    if _unbacked_readback(text, history):
+        return "read back items no tool wrote"
     # A removal is checked against removal tools specifically: other tools
     # running that turn (a log_entry alongside it) say nothing about whether
     # anything was actually deleted.
@@ -314,6 +436,49 @@ def _trim_history(messages: list, max_messages: int) -> list:
         if isinstance(messages[i], HumanMessage):
             return messages[i:]
     return messages
+
+
+def _is_poisoned_reply(msg, history: list) -> bool:
+    """A tool-less reply that must not be shown to the model again."""
+    if getattr(msg, "type", None) != "ai" or getattr(msg, "tool_calls", None):
+        return False
+    if (getattr(msg, "additional_kwargs", None) or {}).get(_BLOCKED_MARKER):
+        return True
+    if _content_to_text(getattr(msg, "content", None)) in _FALLBACK_TEXTS:
+        return True
+    return _fabrication_reason(msg, history) is not None
+
+
+def _scrub_history(messages: list) -> list:
+    """Drop every finished turn that ended in a fabricated or blocked reply.
+
+    Whatever sits in the window is a few-shot example. On 2026-09-22 the thread
+    held "Logged 290 calories for ..." and "Updated entry ... to 280" — spoken
+    with no tool call before the guard knew those shapes — and qwen2.5:14b
+    answered "Log 1050 calories for a frozen pizza" with "Logged 1050 calories
+    for a frozen pizza." and no call, 0/4 times. The same thread with those
+    turns removed: 4/4 real log_entry calls. The guard's own fallback ("Sorry —
+    that didn't go through") is a tool-less answer to a log request too, so
+    each blocked turn used to teach the next one to fail the same way.
+
+    The whole turn goes, user message included: a log request answered by
+    anything but a tool call is exactly the pattern to keep out. The checkpoint
+    keeps everything; this only shapes the prompt. The current turn (the last
+    one) is never touched.
+    """
+    starts = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+    if len(starts) < 2:
+        return messages
+    bounds = list(zip(starts, starts[1:]))
+    drop: set[int] = set()
+    for start, end in bounds:
+        final = messages[end - 1]
+        if _is_poisoned_reply(final, messages[: end - 1]):
+            drop.update(range(start, end))
+    if not drop:
+        return messages
+    logger.info("history scrub: left out %d messages from bad turns", len(drop))
+    return [m for i, m in enumerate(messages) if i not in drop]
 
 
 class ToolCallLogger(BaseCallbackHandler):
@@ -659,7 +824,13 @@ class Agent:
         def assistant(state: MessagesState):
             # Only the last MAX_HISTORY_MESSAGES go to the model; the full
             # thread is still returned below and checkpointed.
-            history = _trim_history(state["messages"], MAX_HISTORY_MESSAGES)
+            # Bad turns are scrubbed first so they don't count toward the
+            # window. Only the tail is scanned: the day's thread only grows,
+            # and turns far outside the window can never reach the prompt.
+            history = _trim_history(
+                _scrub_history(state["messages"][-4 * MAX_HISTORY_MESSAGES :]),
+                MAX_HISTORY_MESSAGES,
+            )
             # Time the model round-trip so a hang here (e.g. a slow/unreachable
             # OpenAI call) is distinguishable from a hang inside a tool: you'll
             # see 'llm start' with no 'llm done'. messages=sent/total shows the
@@ -678,10 +849,16 @@ class Agent:
                 logger.warning("fabricated tool call (%s); retrying", reason)
                 retried = None
                 try:
+                    # A user message, NOT a SystemMessage. Ollama's qwen2.5
+                    # template has no slot for a mid-conversation system
+                    # message and folds it into the system block at the top,
+                    # which invalidates the whole cached prefix (~8.6k
+                    # tokens). The retry then ran past its 10s cap every time
+                    # and never got to recover anything.
                     retried = self.llm.invoke(
                         [self._system_message()]
                         + history
-                        + [SystemMessage(content=_FABRICATION_NUDGE)],
+                        + [HumanMessage(content=_FABRICATION_NUDGE)],
                         timeout=FABRICATION_RETRY_TIMEOUT,
                     )
                 except Exception:
@@ -698,6 +875,10 @@ class Agent:
                     )
                     response.content = _fallback_for(reason)
                     response.tool_calls = []
+                    response.additional_kwargs = {
+                        **(response.additional_kwargs or {}),
+                        _BLOCKED_MARKER: reason,
+                    }
 
             # The model sometimes emits the same tool call twice in one turn;
             # for log_entry that double-writes the user's data. Drop exact dupes
