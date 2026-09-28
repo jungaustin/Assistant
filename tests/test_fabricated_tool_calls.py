@@ -628,6 +628,8 @@ def test_a_blocked_turn_is_left_out_of_the_next_prompt():
     next_prompt = _texts(chat._sent[2])
     assert "Log 1050 calories for a frozen pizza." not in next_prompt
     assert _FABRICATION_FALLBACK not in next_prompt
+    # ...but what was asked survives as a note, so "try again" has a referent.
+    assert any("frozen pizza" in t and "NOT carried out" in t for t in next_prompt)
     assert "what's 1 plus 1?" in next_prompt
 
     # The checkpoint still has the whole exchange; only the prompt is scrubbed.
@@ -656,7 +658,12 @@ def test_legacy_fabrications_already_in_the_thread_are_scrubbed():
         HumanMessage(content="Log 1050 calories for a frozen pizza."),
     ]
     out = _scrub_history(thread)
-    assert _texts(out) == ["Log 1050 calories for a frozen pizza."]
+    texts = _texts(out)
+    assert len(texts) == 3
+    assert "log a Raising Cane's combo" in texts[0] and "NOT carried out" in texts[0]
+    assert "make that 1700" in texts[1] and "NOT carried out" in texts[1]
+    assert texts[2] == "Log 1050 calories for a frozen pizza."
+    assert all(isinstance(m, HumanMessage) for m in out), "no bad reply survives"
 
 
 def test_old_unmarked_fallback_replies_are_scrubbed():
@@ -667,7 +674,10 @@ def test_old_unmarked_fallback_replies_are_scrubbed():
         _ai(_FABRICATION_FALLBACK),
         HumanMessage(content="log 600 for rice"),
     ]
-    assert _texts(_scrub_history(thread)) == ["log 600 for rice"]
+    out = _texts(_scrub_history(thread))
+    assert _FABRICATION_FALLBACK not in out
+    assert out[-1] == "log 600 for rice"
+    assert "NOT carried out" in out[0]
 
 
 def test_honest_turns_and_the_current_turn_are_kept():
@@ -686,3 +696,74 @@ def test_honest_turns_and_the_current_turn_are_kept():
         ToolMessage(content="#2 logged 600", name="log_entry", tool_call_id="e1"),
     ]
     assert _scrub_history(thread) == thread
+
+
+# ---------------------------------------------------------------------------
+# The 2026-09-27 session.
+#
+# "For yesterday, September 26th, log rice, dumplings, kalbi..." was blocked,
+# and the scrub then dropped the request itself: "can you try again?" had
+# nothing to retry, and the items re-dictated one at a time all landed on the
+# 27th. Separately, "change it to 340, then log 120 for cowbee" got only the
+# log_entry call while "Updated entry #445 to 340" rode along and was spoken.
+# ---------------------------------------------------------------------------
+
+
+def test_scrubbed_request_keeps_its_context():
+    from robot.brain.agent import _scrub_history
+
+    thread = [
+        HumanMessage(content="for yesterday, September 26th, log 300 for rice"),
+        _ai(_FABRICATION_FALLBACK),
+        HumanMessage(content="can you try again?"),
+    ]
+    out = _texts(_scrub_history(thread))
+    assert any("September 26th" in t for t in out[:-1])
+    assert out[-1] == "can you try again?"
+
+
+def test_update_claim_beside_an_unrelated_call_is_caught():
+    from robot.brain.agent import _preamble_reason
+
+    resp = _ai(
+        "Updated entry #445 to 340 calories for dumplings.\n",
+        [{"name": "log_entry", "args": {"value": 120}, "id": "e1"}],
+    )
+    history = [HumanMessage(content="change it to 340, then log 120 for cowbee")]
+    assert _preamble_reason(resp, history) == "claimed an update that no tool performed"
+
+
+def test_update_claim_beside_a_real_update_passes():
+    from robot.brain.agent import _preamble_reason
+
+    resp = _ai(
+        "Updating #445 to 340.",
+        [{"name": "update_entry", "args": {"entry_id": 445, "value": 340}, "id": "u1"},
+         {"name": "log_entry", "args": {"value": 120}, "id": "e1"}],
+    )
+    assert _preamble_reason(resp, [HumanMessage(content="x")]) is None
+
+
+def test_final_update_claim_needs_update_entry_not_just_any_write():
+    history = [
+        HumanMessage(content="change it to 340, then log 120 for cowbee"),
+        _ai("", [{"name": "log_entry", "args": {}, "id": "e1"}]),
+        ToolMessage(content="Logged #446: calories = 120.0", name="log_entry",
+                    tool_call_id="e1"),
+    ]
+    reply = _ai("Updated #445 to 340 and logged 120 for cowbee.")
+    assert _fabrication_reason(reply, history) == "claimed an update that no tool performed"
+
+
+def test_unbacked_preamble_is_not_spoken_but_the_real_call_still_runs():
+    lie = _ai(
+        "Updated entry #445 to 340 calories for dumplings.\n",
+        [{"name": "calculate", "args": {"expression": "1+1"}, "id": "c1"}],
+    )
+    agent = _agent_with(lie, lie, _ai("Done."))
+    with patch.object(agent, "append_episode"):
+        spoken = "".join(agent.stream("change it to 340 and what's 1 plus 1"))
+    assert "Updated entry #445" not in spoken
+    assert "couldn't make that change" in spoken
+    history = agent.graph.get_state(agent.config).values["messages"]
+    assert any(getattr(m, "name", None) == "calculate" for m in history if m.type == "tool")

@@ -144,6 +144,16 @@ _CLAIMS_WRITE_RE = re.compile(
 # guard had just blocked. The write check above could not see it: log_entry had
 # run that turn, so the turn was not tool-less. A removal claim needs its own
 # check against a removal actually happening.
+# "Updated entry #445 to 340 calories." — the edit half of the write claim.
+# Checked against update_entry specifically: on 2026-09-27 "change it to 340,
+# then log 120 for cowbee" got only the log_entry call, and "Updated entry
+# #445 to 340" was spoken anyway because *a* write tool had run.
+_CLAIMS_UPDATE_RE = re.compile(
+    r"\b(update|updated|updating|changed|corrected|renamed|moved)\b[^.]{0,80}?"
+    r"(\d|\bto\b)",
+    re.IGNORECASE,
+)
+
 _CLAIMS_DELETE_RE = re.compile(
     r"\b(deleted|removed|cleared|erased|got rid of)\b[^.\n]{0,30}?"
     r"\b(entry|entries|row|rows|log|logs|one|ones|it|them)\b",
@@ -242,7 +252,16 @@ _FABRICATION_FALLBACKS = {
     "claimed a deletion that no tool performed":
         "Sorry — I couldn't remove that, so nothing was deleted. "
         "Ask me to check what's logged and I'll remove it by number.",
+    # Usually sits beside a log that DID happen, so don't say nothing saved.
+    "claimed an update that no tool performed":
+        "Sorry — I didn't make that change, so that entry is as it was. "
+        "Ask me again?",
 }
+
+# Spoken in place of the model's text when its tool calls are real but the
+# words beside them claimed something those calls don't do. The calls still
+# run; only the unbacked claim is withheld.
+_PREAMBLE_FALLBACK = "I couldn't make that change, so that entry is as it was."
 
 
 def _fallback_for(reason: str) -> str:
@@ -299,6 +318,9 @@ def _fabrication_reason(response, history: list) -> str | None:
     # no tool call at all.
     if _CLAIMS_WRITE_RE.search(text) and not (_tools_run_this_turn(history) & _LOG_DB_TOOLS):
         return "claimed a write that no tool performed"
+    # A log_entry that ran this turn says nothing about an edit being made.
+    if _CLAIMS_UPDATE_RE.search(text) and "update_entry" not in _tools_run_this_turn(history):
+        return "claimed an update that no tool performed"
     # A row id the reply cites that no tool ever returned is invented. On
     # 2026-09-22 query_entries returned Sept 20 only, and the model made up
     # rows #419-#426 for Sept 21 and 22, with totals, and spoke them as fact.
@@ -317,6 +339,33 @@ def _fabrication_reason(response, history: list) -> str | None:
     ):
         return "claimed a deletion that no tool performed"
     return None
+
+
+def _preamble_reason(response, history: list) -> str | None:
+    """Does the text riding along with real tool calls claim more than they do?
+
+    Only for replies WITH tool calls. That text is spoken as soon as the node
+    returns, before any tool runs, and _fabrication_reason never looks at it.
+    A claim is backed by a matching tool among this reply's calls or one that
+    already ran this turn.
+    """
+    calls = getattr(response, "tool_calls", None) or []
+    if not calls:
+        return None
+    text = _content_to_text(getattr(response, "content", None))
+    if not text.strip():
+        return None
+    backed = {c.get("name") for c in calls} | _tools_run_this_turn(history)
+    if _CLAIMS_UPDATE_RE.search(text) and "update_entry" not in backed:
+        return "claimed an update that no tool performed"
+    if _CLAIMS_DELETE_RE.search(text) and not (backed & _DESTRUCTIVE_TOOLS):
+        return "claimed a deletion that no tool performed"
+    return None
+
+
+def _reply_problem(response, history: list) -> str | None:
+    """Every unbacked-claim check, for replies with or without tool calls."""
+    return _fabrication_reason(response, history) or _preamble_reason(response, history)
 
 
 # Tools that take an entry_id. That id must be one the model actually SAW,
@@ -449,8 +498,17 @@ def _is_poisoned_reply(msg, history: list) -> bool:
     return _fabrication_reason(msg, history) is not None
 
 
+def _unfulfilled_note(request) -> HumanMessage:
+    """Stand-in for a scrubbed turn: what was asked, and that it never ran."""
+    text = _content_to_text(getattr(request, "content", None))
+    return HumanMessage(
+        content=f'(Earlier I said: "{text}" — that request was NOT carried out '
+        "and nothing from it was saved. Only act on it if I ask again.)"
+    )
+
+
 def _scrub_history(messages: list) -> list:
-    """Drop every finished turn that ended in a fabricated or blocked reply.
+    """Replace every finished turn that ended in a fabricated or blocked reply.
 
     Whatever sits in the window is a few-shot example. On 2026-09-22 the thread
     held "Logged 290 calories for ..." and "Updated entry ... to 280" — spoken
@@ -461,24 +519,40 @@ def _scrub_history(messages: list) -> list:
     that didn't go through") is a tool-less answer to a log request too, so
     each blocked turn used to teach the next one to fail the same way.
 
-    The whole turn goes, user message included: a log request answered by
-    anything but a tool call is exactly the pattern to keep out. The checkpoint
-    keeps everything; this only shapes the prompt. The current turn (the last
-    one) is never touched.
+    The bad reply goes, but what the user asked stays, folded into a single
+    user-role note that says it never ran. Dropping the request too lost its
+    context: on 2026-09-27 "log these for yesterday, September 26th" was
+    scrubbed, so "can you try again?" had nothing to retry and the items the
+    user then dictated one at a time all landed on the 27th. The note keeps
+    the ask without leaving a request→tool-less-answer pair to imitate.
+
+    The checkpoint keeps everything; this only shapes the prompt. The current
+    turn (the last one) is never touched.
     """
     starts = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
     if len(starts) < 2:
         return messages
-    bounds = list(zip(starts, starts[1:]))
-    drop: set[int] = set()
-    for start, end in bounds:
+    replace: dict[int, int] = {}
+    for start, end in zip(starts, starts[1:]):
         final = messages[end - 1]
         if _is_poisoned_reply(final, messages[: end - 1]):
-            drop.update(range(start, end))
-    if not drop:
+            replace[start] = end
+    if not replace:
         return messages
-    logger.info("history scrub: left out %d messages from bad turns", len(drop))
-    return [m for i, m in enumerate(messages) if i not in drop]
+    logger.info(
+        "history scrub: replaced %d bad turns (%d messages) with notes",
+        len(replace), sum(end - start for start, end in replace.items()),
+    )
+    out: list = []
+    i = 0
+    while i < len(messages):
+        if i in replace:
+            out.append(_unfulfilled_note(messages[i]))
+            i = replace[i]
+        else:
+            out.append(messages[i])
+            i += 1
+    return out
 
 
 class ToolCallLogger(BaseCallbackHandler):
@@ -844,7 +918,7 @@ class Agent:
             # Catch a reply that only *describes* doing the work. One corrective
             # retry usually lands a real call; a second failure is answered
             # honestly rather than spoken as if it succeeded.
-            reason = _fabrication_reason(response, history)
+            reason = _reply_problem(response, history)
             if reason is not None:
                 logger.warning("fabricated tool call (%s); retrying", reason)
                 retried = None
@@ -866,8 +940,16 @@ class Agent:
                     # waiting on an answer we already know was wrong.
                     logger.warning("corrective retry failed; answering honestly")
 
-                if retried is not None and _fabrication_reason(retried, history) is None:
+                if retried is not None and _reply_problem(retried, history) is None:
                     response = retried
+                elif getattr(response, "tool_calls", None):
+                    # The calls are real work the user asked for; let them run.
+                    # Only the unbacked words are replaced.
+                    logger.error(
+                        "unbacked claim beside tool calls again (%s); withholding it",
+                        reason,
+                    )
+                    response.content = _PREAMBLE_FALLBACK
                 else:
                     logger.error(
                         "fabricated tool call again (%s); refusing to speak it",
