@@ -13,9 +13,15 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from robot.brain.agent import (
-    _drop_unverified_destructive_calls,
     _ids_the_model_has_seen,
+    _split_unverified_destructive_calls,
 )
+
+
+def _drop_unverified_destructive_calls(resp, history):
+    """The calls that survive the guard, on a copy of the response."""
+    kept, _ = _split_unverified_destructive_calls(resp.tool_calls, history)
+    return resp.model_copy(update={"tool_calls": kept})
 
 
 def _ai(tool_calls):
@@ -169,10 +175,131 @@ def test_an_id_from_an_earlier_turn_is_still_usable():
     assert [c["name"] for c in out.tool_calls] == ["delete_entry"]
 
 
-def test_dropping_the_only_call_still_says_something():
-    resp = _ai([_call("delete_entry", entry_id=1)])
-    out = _drop_unverified_destructive_calls(
-        resp, [HumanMessage(content="delete that")]
+def test_update_with_no_id_is_refused():
+    """2026-10-03: update_entry(entry_id=) for yesterday's burgers.
+
+    Without an id the tool edits the NEWEST row, which was tonight's pork
+    rice bowl, not the entry the user meant.
+    """
+    history = [
+        HumanMessage(content="fix yesterday's burpers entry"),
+        ToolMessage(content="Logged #478: calories = 750.0 (pork rice bowl)",
+                    name="log_meal", tool_call_id="l"),
+    ]
+    for args in ({}, {"entry_id": ""}, {"entry_id": None}):
+        resp = _ai([_call("update_entry", value=540, **args)])
+        assert _drop_unverified_destructive_calls(resp, history).tool_calls == []
+
+
+# --- the refused call is answered, not silently dropped ---------------------
+
+from robot.brain.agent import (  # noqa: E402
+    _refusal_message,
+    _tools_run_this_turn,
+)
+
+
+def test_refusal_tells_the_model_how_to_get_the_id():
+    msg = _refusal_message(_call("update_entry", value=540), prior_refusals=0)
+    assert msg.status == "error"
+    assert msg.name == "update_entry"
+    assert "query_entries" in msg.content
+    assert "nothing was changed" in msg.content
+
+
+def test_refusal_does_not_count_as_the_tool_running():
+    history = [
+        HumanMessage(content="fix it"),
+        _refusal_message(_call("update_entry", value=540), prior_refusals=0),
+    ]
+    assert "update_entry" not in _tools_run_this_turn(history)
+
+
+def test_refusal_never_vouches_for_the_id_it_refused():
+    msg = _refusal_message(_call("delete_entry", entry_id=1), prior_refusals=0)
+    history = [HumanMessage(content="delete that"), msg]
+    assert "1" not in _ids_the_model_has_seen(history)
+
+
+def test_repeated_refusals_tell_the_model_to_stop_and_ask():
+    msg = _refusal_message(_call("update_entry", value=540), prior_refusals=2)
+    assert "Stop retrying" in msg.content
+
+
+def test_promising_an_update_that_never_ran_is_caught():
+    """The exact closing line spoken on 2026-10-03, with the entry unchanged."""
+    from robot.brain.agent import _fabrication_reason
+
+    history = [
+        HumanMessage(content="can you double check that and fix it for me?"),
+        ToolMessage(content="Past logs matching 'In-N-Out burger': ...",
+                    name="lookup_food", tool_call_id="f"),
+    ]
+    for text in (
+        "So two burgers would be 540 calories. I'll update the entry for you.",
+        "I will correct the entry for yesterday.",
+        "Let me fix that.",
+    ):
+        reply = AIMessage(content=text)
+        assert _fabrication_reason(reply, history) == (
+            "claimed an update that no tool performed"
+        ), text
+
+
+def test_asking_whether_to_update_is_not_a_claim():
+    from robot.brain.agent import _fabrication_reason
+
+    h = [HumanMessage(content="what did I eat yesterday?")]
+    for text in ("Want me to fix that?", "Should I change it to 540?"):
+        r = _fabrication_reason(AIMessage(content=text), h)
+        assert r != "claimed an update that no tool performed", (text, r)
+
+
+def test_refused_update_lets_the_model_look_up_the_id_and_retry():
+    """End to end through the graph: the burger replay from 2026-10-03.
+
+    The model first tries an id-less update, gets the refusal back as a tool
+    result, queries yesterday, and updates the right row. Tonight's rows are
+    untouched.
+    """
+    from datetime import date, timedelta
+    from unittest.mock import patch
+
+    from tests.test_fabricated_tool_calls import _agent_with
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    probe = _agent_with()
+    db = probe._tm.log_tools.db
+    burger = db.log_entry("calories", 270, "two burpers from in-n-out", yesterday)
+    burger_id = int(burger.split("#")[1].split(":")[0])
+    tonight = db.log_entry("calories", 750, "pork rice bowl")
+    tonight_id = int(tonight.split("#")[1].split(":")[0])
+
+    agent = _agent_with(
+        AIMessage(content="", tool_calls=[
+            {"name": "update_entry", "args": {"value": 540}, "id": "u1"},
+        ]),
+        AIMessage(content="", tool_calls=[
+            {"name": "query_entries",
+             "args": {"type": "calories", "start_date": yesterday,
+                      "end_date": yesterday}, "id": "q1"},
+        ]),
+        AIMessage(content="", tool_calls=[
+            {"name": "update_entry",
+             "args": {"entry_id": burger_id, "value": 540,
+                      "note": "two burgers from in-n-out"}, "id": "u2"},
+        ]),
+        AIMessage(content="Fixed: two burgers from In-N-Out, 540."),
     )
-    assert out.tool_calls == []
-    assert "didn't delete anything" in out.content
+    with patch.object(agent, "append_episode"):
+        spoken = "".join(agent.stream("fix yesterday's burpers, 270 each"))
+
+    assert "540" in spoken
+    rows = {r[0]: r for r in db._conn.execute(
+        "SELECT id, value, note FROM entries WHERE id IN (?, ?)",
+        (burger_id, tonight_id),
+    )}
+    assert rows[burger_id][1:] == (540.0, "two burgers from in-n-out")
+    assert rows[tonight_id][1:] == (750.0, "pork rice bowl")
+    db._conn.execute("DELETE FROM entries WHERE id IN (?, ?)", (burger_id, tonight_id))
+    db._conn.commit()

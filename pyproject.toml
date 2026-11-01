@@ -35,6 +35,7 @@ dependencies = [
     "structlog>=25.5.0",
     "pyobjc-framework-quartz>=12.2.1",
     "websockets>=15",
+    "discord-py>=2.7.1",
 ]
 
 [project.optional-dependencies]

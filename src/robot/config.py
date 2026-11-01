@@ -282,6 +282,17 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 # your personal read state with bots, so Nemo tracks its own.
 DISCORD_CURSOR_PATH = os.getenv("DISCORD_CURSOR_PATH", "state/discord_cursors.json")
 
+# Discord agent channel (robot.discord_agent): messages from the owner in this
+# one channel are run through the Agent. Ids are numeric snowflakes; kept as
+# strings here and parsed at startup so a typo fails with a clear message.
+DISCORD_AGENT_CHANNEL_ID = os.getenv("DISCORD_AGENT_CHANNEL_ID", "")
+# Blank = the bot application's owner, resolved from the API at startup.
+DISCORD_OWNER_ID = os.getenv("DISCORD_OWNER_ID", "")
+# Last message id handled, so a restart can catch up on what it missed.
+DISCORD_AGENT_STATE_PATH = os.getenv(
+    "DISCORD_AGENT_STATE_PATH", "state/discord_agent.json"
+)
+
 # Google Calendar. credentials.json is downloaded once from the Google
 # Cloud Console (Desktop app OAuth client). The token file is written by
 # the OAuth bootstrap and refreshed automatically on use. Both live in

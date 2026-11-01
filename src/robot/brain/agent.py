@@ -17,7 +17,13 @@ from typing import Optional
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import HumanMessage, SystemMessage, trim_messages
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    trim_messages,
+)
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import START, MessagesState, StateGraph
@@ -154,6 +160,21 @@ _CLAIMS_UPDATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "I'll update the entry for you." — spoken on 2026-10-03 as the whole answer
+# to "fix yesterday's burpers entry", after the guard had refused the update
+# twice. No digit and no "to", so _CLAIMS_UPDATE_RE let it through. A first-
+# person promise to edit is a claim too: nothing will carry it out later.
+_PROMISES_UPDATE_RE = re.compile(
+    r"\b(?:i'?ll|i will|i'm going to|i am going to|let me)\s+(?:now\s+|go ahead and\s+)?"
+    r"(?:update|correct|fix|change|edit|adjust)\b",
+    re.IGNORECASE,
+)
+
+
+def _claims_update(text: str) -> bool:
+    return bool(_CLAIMS_UPDATE_RE.search(text) or _PROMISES_UPDATE_RE.search(text))
+
+
 _CLAIMS_DELETE_RE = re.compile(
     r"\b(deleted|removed|cleared|erased|got rid of)\b[^.\n]{0,30}?"
     r"\b(entry|entries|row|rows|log|logs|one|ones|it|them)\b",
@@ -174,6 +195,11 @@ _TOOL_NOISE_RE = re.compile(r"#\d+|\d{4}-\d{2}-\d{2}")
 _NUMBER_RE = re.compile(r"[\d,]+(?:\.\d+)?")
 
 
+def _tool_failed(msg) -> bool:
+    """A tool result that did no work: the guard refused it, or it raised."""
+    return getattr(msg, "status", None) == "error"
+
+
 def _as_number(raw: str):
     try:
         return float(raw.replace(",", ""))
@@ -189,7 +215,7 @@ def _values_written_this_turn(history: list) -> set[float]:
             break
         if getattr(msg, "type", None) != "tool":
             continue
-        if getattr(msg, "name", None) not in _WRITE_TOOLS:
+        if getattr(msg, "name", None) not in _WRITE_TOOLS or _tool_failed(msg):
             continue
         text = _TOOL_NOISE_RE.sub(" ", _content_to_text(getattr(msg, "content", None)))
         for raw in _NUMBER_RE.findall(text):
@@ -290,7 +316,7 @@ def _tools_run_this_turn(history: list) -> set[str]:
     for msg in reversed(history):
         if getattr(msg, "type", None) == "human":
             break
-        if getattr(msg, "type", None) == "tool":
+        if getattr(msg, "type", None) == "tool" and not _tool_failed(msg):
             name = getattr(msg, "name", None)
             if name:
                 names.add(name)
@@ -319,7 +345,7 @@ def _fabrication_reason(response, history: list) -> str | None:
     if _CLAIMS_WRITE_RE.search(text) and not (_tools_run_this_turn(history) & _LOG_DB_TOOLS):
         return "claimed a write that no tool performed"
     # A log_entry that ran this turn says nothing about an edit being made.
-    if _CLAIMS_UPDATE_RE.search(text) and "update_entry" not in _tools_run_this_turn(history):
+    if _claims_update(text) and "update_entry" not in _tools_run_this_turn(history):
         return "claimed an update that no tool performed"
     # A row id the reply cites that no tool ever returned is invented. On
     # 2026-09-22 query_entries returned Sept 20 only, and the model made up
@@ -356,7 +382,7 @@ def _preamble_reason(response, history: list) -> str | None:
     if not text.strip():
         return None
     backed = {c.get("name") for c in calls} | _tools_run_this_turn(history)
-    if _CLAIMS_UPDATE_RE.search(text) and "update_entry" not in backed:
+    if _claims_update(text) and "update_entry" not in backed:
         return "claimed an update that no tool performed"
     if _CLAIMS_DELETE_RE.search(text) and not (backed & _DESTRUCTIVE_TOOLS):
         return "claimed a deletion that no tool performed"
@@ -418,42 +444,79 @@ def _ids_the_model_has_seen(history: list) -> set[str]:
     return seen
 
 
-def _drop_unverified_destructive_calls(response, history: list):
-    """Remove delete/update calls targeting an id the model never saw.
+def _split_unverified_destructive_calls(calls: list, history: list):
+    """Separate delete/update calls targeting an id the model never saw.
 
     Reads issued in the SAME batch cannot have answered yet, so an id that only
-    a same-batch query could supply is by definition guessed. Dropping the call
-    (rather than running it) lets the tool results come back and the model
-    reissue it against real ids on the next pass.
-    """
-    calls = list(getattr(response, "tool_calls", None) or [])
-    if not any(c.get("name") in _ID_TARGETED_TOOLS for c in calls):
-        return response
+    a same-batch query could supply is by definition guessed. A missing id is
+    refused too: update_entry/delete_entry then fall back to "the newest row",
+    which on 2026-10-03 would have rewritten tonight's pork rice bowl when the
+    user asked to fix yesterday's burgers.
 
+    Returns (kept, refused).
+    """
+    if not any(c.get("name") in _ID_TARGETED_TOOLS for c in calls):
+        return list(calls), []
     seen = _ids_the_model_has_seen(history)
-    kept = []
+    kept, refused = [], []
     for call in calls:
         if call.get("name") in _ID_TARGETED_TOOLS:
-            target = str((call.get("args") or {}).get("entry_id", ""))
+            target = str((call.get("args") or {}).get("entry_id") or "")
             if target not in seen:
                 logger.error(
-                    "dropped %s(entry_id=%s): id never appeared in a tool result "
-                    "this turn (seen=%s) — refusing to delete a guessed row",
+                    "refused %s(entry_id=%s): id never appeared in a tool result "
+                    "(seen=%s) — refusing to touch a guessed row",
                     call.get("name"), target, sorted(seen) or "none",
                 )
+                refused.append(call)
                 continue
         kept.append(call)
+    return kept, refused
 
-    if len(kept) != len(calls):
-        response.tool_calls = kept
-        # Dropping the only call leaves an empty turn — the robot just goes
-        # silent, which reads as a crash. Say what happened instead.
-        if not kept and not _content_to_text(getattr(response, "content", None)).strip():
-            response.content = (
-                "I couldn't tell which entry you meant, so I didn't delete "
-                "anything. Tell me the day or the food and I'll remove it."
-            )
-    return response
+
+def _refusals_this_turn(history: list) -> int:
+    n = 0
+    for msg in reversed(history):
+        if getattr(msg, "type", None) == "human":
+            break
+        if getattr(msg, "type", None) == "tool" and _tool_failed(msg):
+            n += 1
+    return n
+
+
+def _refusal_message(call: dict, prior_refusals: int) -> ToolMessage:
+    """The tool result the model gets back for a refused call.
+
+    The refusal used to be silent: the call just vanished. On 2026-10-03 the
+    model never learned why, re-issued the same id-less update_entry, had it
+    dropped again, and then told the user "I'll update the entry for you" —
+    and the entry stayed wrong. Answering the call with a tool result tells the
+    model what it is missing and how to get it.
+
+    Deliberately no '#<digits>' in here: _ids_the_model_has_seen would read
+    it as a real row id.
+    """
+    name = call.get("name")
+    target = (call.get("args") or {}).get("entry_id")
+    what = f"entry_id={target} never appeared in a tool result" if target not in (None, "") \
+        else "no entry_id was given"
+    if prior_refusals >= 2:
+        content = (
+            f"REFUSED again, nothing was changed: {what}. Stop retrying "
+            f"{name}. Tell the user you couldn't find that entry and ask which "
+            "day it was logged on."
+        )
+    else:
+        content = (
+            f"REFUSED, nothing was changed: {name} needs the id of the exact row "
+            f"and {what}. Call query_entries with start_date and end_date set to "
+            f"the day the entry was logged; each row it returns starts with its "
+            f"id. Then call {name} again with that entry_id. Do not tell the user "
+            f"anything was changed until a {name} result says so."
+        )
+    return ToolMessage(
+        content=content, name=name, tool_call_id=call.get("id"), status="error"
+    )
 
 
 def _trim_history(messages: list, max_messages: int) -> list:
@@ -633,6 +696,8 @@ class Agent:
     thread_id defaults to today's local date (see config.daily_thread_id),
     so turns within a day chain together and conversations reset overnight.
     Pass an explicit `thread_id` for tests or off-policy sessions.
+    `thread_prefix` namespaces the day-scoped id (e.g. "discord-") and is
+    ignored when thread_id is pinned.
     """
 
     def __init__(
@@ -642,8 +707,13 @@ class Agent:
         checkpointer: Optional[SqliteSaver] = None,
         memory_store: Optional[MemoryStore] = None,
         clip_service=None,
+        thread_prefix: str = "",
     ):
-        self.thread_id = thread_id or daily_thread_id()
+        # A separate front-end process (the Discord agent) passes a prefix so
+        # its day thread never shares a LangGraph checkpoint with the voice
+        # process's. Empty by default: the voice path's ids are unchanged.
+        self._thread_prefix = thread_prefix
+        self.thread_id = thread_id or (thread_prefix + daily_thread_id())
         # An explicitly passed thread_id is pinned (tests, off-policy
         # sessions); only the default day-scoped policy rolls at midnight.
         self._thread_pinned = thread_id is not None
@@ -754,7 +824,7 @@ class Agent:
         No-op for pinned (explicitly passed) thread_ids."""
         if self._thread_pinned:
             return
-        current = daily_thread_id()
+        current = self._thread_prefix + daily_thread_id()
         if current != self.thread_id:
             logger.info("daily thread rollover from=%s to=%s", self.thread_id, current)
             self.thread_id = current
@@ -966,18 +1036,38 @@ class Agent:
             # for log_entry that double-writes the user's data. Drop exact dupes
             # before ToolNode runs them.
             response = _dedupe_tool_calls(response)
-            # A guessed entry_id destroys a real row, so this runs before the
-            # tools do, not as a check afterwards.
-            response = _drop_unverified_destructive_calls(response, history)
             n_calls = len(getattr(response, "tool_calls", None) or [])
             logger.info(
                 "llm done  elapsed=%.2fs tool_calls=%d", time.monotonic() - t0, n_calls
             )
             return {"messages": state["messages"] + [response]}
 
+        tool_node = ToolNode(self.tools)
+
+        def tools(state: MessagesState, config: RunnableConfig):
+            # A guessed entry_id destroys a real row, so it is checked here,
+            # before the tools run, not afterwards. The refused call still gets
+            # a tool result so the model knows to look the id up and retry.
+            messages = state["messages"]
+            request = messages[-1]
+            history = _trim_history(
+                _scrub_history(messages[-4 * MAX_HISTORY_MESSAGES : -1]),
+                MAX_HISTORY_MESSAGES,
+            )
+            kept, refused = _split_unverified_destructive_calls(
+                request.tool_calls, history
+            )
+            prior = _refusals_this_turn(history)
+            results = [_refusal_message(c, prior) for c in refused]
+            if kept:
+                run = request.model_copy(update={"tool_calls": kept})
+                out = tool_node.invoke({"messages": messages[:-1] + [run]}, config)
+                results = out["messages"] + results
+            return {"messages": results}
+
         builder = StateGraph(MessagesState)
         builder.add_node("assistant", assistant)
-        builder.add_node("tools", ToolNode(self.tools))
+        builder.add_node("tools", tools)
         builder.add_edge(START, "assistant")
         builder.add_conditional_edges("assistant", tools_condition)
         builder.add_edge("tools", "assistant")
